@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from pluton_client import verifier_cle
-from schemas import CompteGrindSignup, CompteGrindLogin
+from schemas import CompteGrindSignup, CompteGrindLogin, ChangerMotDePasse
 from models import CompteGrind
 from auth_grind import hacher_mot_de_passe, verifier_mot_de_passe, creer_session
 
@@ -54,3 +54,19 @@ async def login(data: CompteGrindLogin, db: Session = Depends(get_db)):
 
     token = creer_session(compte.username, db)
     return {"success": True, "session_token": token, "username": compte.username}
+
+
+@router.post("/api/compte/changer-mot-de-passe")
+async def changer_mot_de_passe(data: ChangerMotDePasse, db: Session = Depends(get_db)):
+    from auth_grind import verifier_session
+    username = verifier_session(data.session_token, db)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Session GRIND invalide ou expirée")
+
+    compte = db.get(CompteGrind, username)
+    if not verifier_mot_de_passe(data.ancien_mot_de_passe, compte.password_hash):
+        raise HTTPException(status_code=401, detail="Ancien mot de passe incorrect")
+
+    compte.password_hash = hacher_mot_de_passe(data.nouveau_mot_de_passe)
+    db.commit()
+    return {"success": True, "message": "Mot de passe changé"}

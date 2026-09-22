@@ -17,6 +17,12 @@ class CompteGrindLogin(BaseModel):
     password: str
 
 
+class ChangerMotDePasse(BaseModel):
+    session_token: str
+    ancien_mot_de_passe: str
+    nouveau_mot_de_passe: str
+
+
 class SessionRequest(BaseModel):
     session_token: str
 

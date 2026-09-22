@@ -35,6 +35,21 @@ async def creer_ou_maj_profil(data: ProfilCreate, db: Session = Depends(get_db))
     return {"success": True, "message": "Profil enregistré"}
 
 
+@router.get("/api/profil/moi")
+async def lire_mon_profil(session_token: str, db: Session = Depends(get_db)):
+    username = _identite(session_token, db)
+    profil = db.get(Profil, username)
+
+    return {
+        "username": username,
+        "profil_existe": profil is not None,
+        "age": profil.age if profil else None,
+        "pays": profil.pays if profil else None,
+        "niveau": profil.niveau if profil else None,
+        "difficultes": profil.difficultes if profil else None,
+    }
+
+
 @router.post("/api/classes")
 async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
     username = _identite(data.session_token, db)
