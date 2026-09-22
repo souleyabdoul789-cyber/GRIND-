@@ -6,9 +6,12 @@ load_dotenv()  # charge le fichier .env AVANT tout le reste — doit rester la 1
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from database import Base, engine
-from pluton_client import verifier_cle
-from schemas import VerifKeyRequest
+from database import Base, engine, get_db
+from fastapi import Depends
+from sqlalchemy.orm import Session
+from auth_grind import verifier_session
+from schemas import SessionRequest
+from routes_compte import router as router_compte
 from routes_profil_classes import router as router_profil_classes
 from routes_aide import router as router_aide
 from routes_posts import router as router_posts
@@ -26,6 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(router_compte)
 app.include_router(router_profil_classes)
 app.include_router(router_aide)
 app.include_router(router_posts)
@@ -43,18 +47,18 @@ async def racine():
 
 
 @app.post("/api/check-access")
-async def check_access(data: VerifKeyRequest):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+async def check_access(data: SessionRequest, db: Session = Depends(get_db)):
+    username = verifier_session(data.session_token, db)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Session GRIND invalide ou expirée")
     return {"success": True, "username": username}
 
 
 @app.post("/api/turn-credentials")
-async def turn_credentials(data: VerifKeyRequest):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+async def turn_credentials(data: SessionRequest, db: Session = Depends(get_db)):
+    username = verifier_session(data.session_token, db)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Session GRIND invalide ou expirée")
 
     if not METERED_TURN_USERNAME or not METERED_TURN_CREDENTIAL:
         raise HTTPException(status_code=500, detail="Identifiants TURN non configurés côté serveur")

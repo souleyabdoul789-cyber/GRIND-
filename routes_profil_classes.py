@@ -3,18 +3,23 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database import get_db
-from pluton_client import verifier_cle
+from auth_grind import verifier_session
 from schemas import ProfilCreate, ClasseCreate, ClasseRejoindre
 from models import Profil, Classe, ClasseMembre
 
 router = APIRouter()
 
 
+def _identite(session_token: str, db: Session) -> str:
+    username = verifier_session(session_token, db)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Session GRIND invalide ou expirée — reconnecte-toi")
+    return username
+
+
 @router.post("/api/profil")
 async def creer_ou_maj_profil(data: ProfilCreate, db: Session = Depends(get_db)):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+    username = _identite(data.session_token, db)
 
     profil = db.get(Profil, username)
     if profil is None:
@@ -32,9 +37,7 @@ async def creer_ou_maj_profil(data: ProfilCreate, db: Session = Depends(get_db))
 
 @router.post("/api/classes")
 async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+    username = _identite(data.session_token, db)
 
     code = secrets.token_urlsafe(8)
     classe = Classe(nom=data.nom, code_invitation=code, createur_username=username)
@@ -55,9 +58,7 @@ async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
 
 @router.post("/api/classes/rejoindre")
 async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db)):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+    username = _identite(data.session_token, db)
 
     classe = db.query(Classe).filter(Classe.code_invitation == data.code_invitation).first()
     if classe is None:

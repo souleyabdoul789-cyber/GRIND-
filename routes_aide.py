@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database import get_db
-from pluton_client import verifier_cle
+from auth_grind import verifier_session
 from schemas import DemandeAideCreate, AideAccepter
 from models import DemandeAide, AideParticipant
 from ws_manager import manager
@@ -11,11 +11,16 @@ from matching import trouver_meilleurs_candidats
 router = APIRouter()
 
 
+def _identite(session_token: str, db: Session) -> str:
+    username = verifier_session(session_token, db)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Session GRIND invalide ou expirée — reconnecte-toi")
+    return username
+
+
 @router.post("/api/aide/demander")
 async def demander_aide(data: DemandeAideCreate, db: Session = Depends(get_db)):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+    username = _identite(data.session_token, db)
 
     demande = DemandeAide(
         demandeur_username=username,
@@ -45,9 +50,7 @@ async def lister_demandes_ouvertes(db: Session = Depends(get_db)):
 
 @router.post("/api/aide/accepter")
 async def accepter_demande(data: AideAccepter, db: Session = Depends(get_db)):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+    username = _identite(data.session_token, db)
 
     demande = db.get(DemandeAide, data.demande_id)
     if demande is None:

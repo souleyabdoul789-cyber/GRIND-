@@ -11,6 +11,30 @@ from sqlalchemy.sql import func
 from database import Base
 
 
+class CompteGrind(Base):
+    """Compte propre à GRIND — distinct du compte G-SOCIETY. La clé API
+    G-SOCIETY (catégorie "grind") n'est vérifiée qu'UNE FOIS, à
+    l'inscription, comme preuve de sécurité — pas à chaque requête."""
+    __tablename__ = "comptes_grind"
+
+    username = Column(String(64), primary_key=True)
+    password_hash = Column(String(128), nullable=False)
+    gsociety_username = Column(String(64), nullable=False)  # traçabilité : quel compte G-SOCIETY a validé l'inscription
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class GrindSession(Base):
+    """Session GRIND, créée au login. Le session_token (pas la clé
+    G-SOCIETY) est ce que le frontend envoie ensuite à chaque requête."""
+    __tablename__ = "grind_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    token_hash = Column(String(128), unique=True, nullable=False, index=True)
+    username = Column(String(64), ForeignKey("comptes_grind.username"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class Profil(Base):
     """Rempli via le questionnaire obligatoire avant la première
     utilisation. Sert à l'algorithme de matching et à l'IA de structuration."""

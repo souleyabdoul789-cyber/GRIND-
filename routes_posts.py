@@ -10,8 +10,8 @@ Deux catégories de post :
                      (vérifié paresseusement à la lecture — pas besoin
                      d'un job planifié pour un prototype).
 
-Comme partout ailleurs : l'identité vient de Pluton (verifier_cle),
-jamais d'un champ envoyé par le client.
+Comme partout ailleurs : l'identité vient de la session GRIND
+(auth_grind.verifier_session), jamais d'un champ envoyé par le client.
 """
 
 from datetime import datetime, timezone
@@ -19,11 +19,19 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database import get_db
-from pluton_client import verifier_cle
+from auth_grind import verifier_session
 from schemas import PostCreate, CommentaireCreate, LikeToggle, ResoudrePost, ExpirerPost
 from models import Post, PostLike, PostCommentaire
 
 router = APIRouter()
+
+
+def _identite(session_token: str, db: Session) -> str:
+    username = verifier_session(session_token, db)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Session GRIND invalide ou expirée — reconnecte-toi")
+    return username
+
 
 CATEGORIES_VALIDES = ("demonstration", "probleme")
 
@@ -57,9 +65,7 @@ def _serialiser(post: Post, db: Session) -> dict:
 
 @router.post("/api/posts")
 async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+    username = _identite(data.session_token, db)
 
     if data.categorie not in CATEGORIES_VALIDES:
         raise HTTPException(status_code=400, detail=f"Catégorie invalide, attendu: {CATEGORIES_VALIDES}")
@@ -105,9 +111,7 @@ async def lister_posts(categorie: str | None = None, db: Session = Depends(get_d
 
 @router.post("/api/posts/{post_id}/like")
 async def toggler_like(post_id: int, data: LikeToggle, db: Session = Depends(get_db)):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+    username = _identite(data.session_token, db)
 
     post = db.get(Post, post_id)
     if post is None:
@@ -129,9 +133,7 @@ async def toggler_like(post_id: int, data: LikeToggle, db: Session = Depends(get
 
 @router.post("/api/posts/{post_id}/commentaires")
 async def commenter(post_id: int, data: CommentaireCreate, db: Session = Depends(get_db)):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+    username = _identite(data.session_token, db)
 
     post = db.get(Post, post_id)
     if post is None:
@@ -173,9 +175,7 @@ async def lister_commentaires(post_id: int, db: Session = Depends(get_db)):
 
 @router.post("/api/posts/{post_id}/resoudre")
 async def resoudre_post(post_id: int, data: ResoudrePost, db: Session = Depends(get_db)):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+    username = _identite(data.session_token, db)
 
     post = db.get(Post, post_id)
     if post is None:
@@ -197,9 +197,7 @@ async def resoudre_post(post_id: int, data: ResoudrePost, db: Session = Depends(
 
 @router.post("/api/posts/{post_id}/expirer")
 async def expirer_post_manuellement(post_id: int, data: ExpirerPost, db: Session = Depends(get_db)):
-    valide, username = await verifier_cle(data.api_key)
-    if not valide:
-        raise HTTPException(status_code=401, detail="Clé API invalide ou expirée")
+    username = _identite(data.session_token, db)
 
     post = db.get(Post, post_id)
     if post is None:
