@@ -6,6 +6,7 @@ from database import get_db
 from auth_grind import verifier_session
 from schemas import ProfilCreate, ClasseCreate, ClasseRejoindre
 from models import Profil, Classe, ClasseMembre
+from ws_manager import manager
 
 router = APIRouter()
 
@@ -89,4 +90,28 @@ async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db))
     db.add(ClasseMembre(classe_id=classe.id, username=username, role="membre"))
     db.commit()
 
+    await manager.notifier_nouveau_membre_classe(classe.id, classe.nom, classe.createur_username, username)
+
     return {"success": True, "classe_id": classe.id, "nom": classe.nom}
+
+
+@router.get("/api/classes/mes-classes")
+async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
+    username = _identite(session_token, db)
+
+    memberships = db.query(ClasseMembre).filter(ClasseMembre.username == username).all()
+    resultat = []
+    for m in memberships:
+        classe = db.get(Classe, m.classe_id)
+        if classe is None:
+            continue
+        nb_membres = db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count()
+        resultat.append({
+            "classe_id": classe.id,
+            "nom": classe.nom,
+            "role": m.role,
+            "code_invitation": classe.code_invitation,
+            "nb_membres": nb_membres,
+        })
+
+    return {"classes": resultat}

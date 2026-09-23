@@ -46,6 +46,17 @@ class ConnectionManager:
         if ws:
             await ws.send_json(payload)
 
+    async def notifier_nouveau_membre_classe(self, classe_id: int, nom_classe: str, createur: str, nouveau_membre: str):
+        payload = {
+            "type": "nouveau_membre_classe",
+            "classe_id": classe_id,
+            "nom_classe": nom_classe,
+            "nouveau_membre": nouveau_membre,
+        }
+        ws = self.notif_connections.get(createur)
+        if ws:
+            await ws.send_json(payload)
+
     # ---------- Canal de session (aide en cours / classe) ----------
     async def connect_session(self, demande_id: int, username: str, ws: WebSocket):
         await ws.accept()
