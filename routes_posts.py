@@ -57,6 +57,8 @@ def _serialiser(post: Post, db: Session) -> dict:
         "date_limite": post.date_limite.isoformat() if post.date_limite else None,
         "statut": post.statut,
         "raison_expiration": post.raison_expiration,
+        "media_url": post.media_url,
+        "media_type": post.media_type,
         "created_at": post.created_at.isoformat() if post.created_at else None,
         "likes": nb_likes,
         "commentaires": nb_commentaires,
@@ -87,6 +89,8 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
         contenu=data.contenu,
         date_limite=date_limite_parsed,
         statut="ouverte" if data.categorie == "probleme" else "publiee",
+        media_url=data.media_url,
+        media_type=data.media_type,
     )
     db.add(post)
     db.commit()

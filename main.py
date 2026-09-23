@@ -16,6 +16,7 @@ from routes_profil_classes import router as router_profil_classes
 from routes_aide import router as router_aide
 from routes_posts import router as router_posts
 from websocket_routes import router as router_ws
+from media import router as router_media
 
 METERED_TURN_USERNAME = os.getenv("METERED_TURN_USERNAME")
 METERED_TURN_CREDENTIAL = os.getenv("METERED_TURN_CREDENTIAL")
@@ -34,6 +35,7 @@ app.include_router(router_profil_classes)
 app.include_router(router_aide)
 app.include_router(router_posts)
 app.include_router(router_ws)
+app.include_router(router_media)
 
 
 @app.on_event("startup")

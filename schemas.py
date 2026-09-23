@@ -61,6 +61,8 @@ class PostCreate(BaseModel):
     categorie: str  # "demonstration" ou "probleme"
     contenu: str
     date_limite: Optional[str] = None  # ISO 8601, requis si categorie == "probleme"
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None  # "image" ou "video"
 
 
 class CommentaireCreate(BaseModel):

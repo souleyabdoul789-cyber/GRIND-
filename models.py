@@ -112,6 +112,8 @@ class Post(Base):
     date_limite = Column(DateTime(timezone=True), nullable=True)  # requis si categorie == "probleme"
     statut = Column(String(16), default="ouverte")  # ouverte / resolue / expiree / publiee (demonstration)
     raison_expiration = Column(Text, nullable=True)
+    media_url = Column(String(512), nullable=True)
+    media_type = Column(String(8), nullable=True)  # "image" ou "video"
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
