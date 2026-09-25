@@ -85,5 +85,13 @@ class ConnectionManager:
             if username != sender:
                 await ws.send_json(message)
 
+    async def notifier_depart(self, demande_id: int, username_parti: str):
+        """Prévient les participants restants qu'un membre vient de quitter
+        la salle — sans ça, l'UI de l'autre le montrerait encore présent."""
+        participants = self.session_connections.get(demande_id, {})
+        for username, ws in participants.items():
+            if username != username_parti:
+                await ws.send_json({"type": "peer-parti", "sender": username_parti})
+
 
 manager = ConnectionManager()

@@ -12,7 +12,7 @@ via connect_args à la place.
 
 import os
 from urllib.parse import urlparse, urlunparse
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 RAW_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./grind.db")
@@ -42,3 +42,30 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def migrer_colonnes_manquantes(base_declarative):
+    """create_all() ne crée que les tables absentes, jamais les colonnes
+    manquantes sur une table déjà existante. Cette fonction compare le
+    modèle Python à la vraie base et ajoute (ALTER TABLE) ce qui manque —
+    une "migration" légère, pas un vrai Alembic, mais suffisante pour ce
+    projet tant qu'on n'a pas des changements de colonnes plus complexes
+    (renommage, changement de type...)."""
+    inspecteur = inspect(engine)
+    with engine.begin() as connexion:
+        for nom_table, table in base_declarative.metadata.tables.items():
+            if nom_table not in inspecteur.get_table_names():
+                continue  # create_all() s'en charge déjà
+            colonnes_existantes = {c["name"] for c in inspecteur.get_columns(nom_table)}
+            for colonne in table.columns:
+                if colonne.name in colonnes_existantes:
+                    continue
+                type_sql = colonne.type.compile(dialect=engine.dialect)
+                nullable = "NULL" if colonne.nullable else "NOT NULL"
+                try:
+                    connexion.execute(text(
+                        f"ALTER TABLE {nom_table} ADD COLUMN {colonne.name} {type_sql} {nullable}"
+                    ))
+                    print(f"Migration : colonne '{colonne.name}' ajoutée à '{nom_table}'")
+                except Exception as e:
+                    print(f"Migration échouée pour {nom_table}.{colonne.name} : {e}")

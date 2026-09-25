@@ -6,7 +6,7 @@ load_dotenv()  # charge le fichier .env AVANT tout le reste — doit rester la 1
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from database import Base, engine, get_db
+from database import Base, engine, get_db, migrer_colonnes_manquantes
 from fastapi import Depends
 from sqlalchemy.orm import Session
 from auth_grind import verifier_session
@@ -41,6 +41,7 @@ app.include_router(router_media)
 @app.on_event("startup")
 def creer_tables():
     Base.metadata.create_all(bind=engine)
+    migrer_colonnes_manquantes(Base)
 
 
 @app.get("/")
