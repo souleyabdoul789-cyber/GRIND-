@@ -62,6 +62,8 @@ async def ws_session(websocket: WebSocket, demande_id: int, session_token: str =
 
             if type_ in ("webrtc-offer", "webrtc-answer", "webrtc-ice"):
                 await manager.relay(demande_id, username, msg, cible=msg.get("cible"))
+            elif type_ == "ready":
+                await manager.relay(demande_id, username, msg)
             elif type_ == "sheet-update":
                 await manager.relay(demande_id, username, msg)
             elif type_ == "demande-voir-feuille":
