@@ -45,6 +45,11 @@ class ClasseRejoindre(BaseModel):
     code_invitation: str
 
 
+class ClasseRenommer(BaseModel):
+    session_token: str
+    nom: str
+
+
 class DemandeAideCreate(BaseModel):
     session_token: str
     sujet: str

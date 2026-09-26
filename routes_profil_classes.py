@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from auth_grind import verifier_session
-from schemas import ProfilCreate, ClasseCreate, ClasseRejoindre
+from schemas import ProfilCreate, ClasseCreate, ClasseRejoindre, ClasseRenommer
 from models import Profil, Classe, ClasseMembre
 from ws_manager import manager
 
@@ -115,3 +115,36 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
         })
 
     return {"classes": resultat}
+
+
+@router.patch("/api/classes/{classe_id}")
+async def renommer_classe(classe_id: int, data: ClasseRenommer, db: Session = Depends(get_db)):
+    username = _identite(data.session_token, db)
+
+    classe = db.get(Classe, classe_id)
+    if classe is None:
+        raise HTTPException(status_code=404, detail="Classe introuvable")
+    if classe.createur_username != username:
+        raise HTTPException(status_code=403, detail="Seul le créateur peut renommer cette classe")
+
+    classe.nom = data.nom
+    db.commit()
+
+    return {"success": True, "nom": classe.nom}
+
+
+@router.delete("/api/classes/{classe_id}")
+async def supprimer_classe(classe_id: int, session_token: str, db: Session = Depends(get_db)):
+    username = _identite(session_token, db)
+
+    classe = db.get(Classe, classe_id)
+    if classe is None:
+        raise HTTPException(status_code=404, detail="Classe introuvable")
+    if classe.createur_username != username:
+        raise HTTPException(status_code=403, detail="Seul le créateur peut supprimer cette classe")
+
+    db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe_id).delete()
+    db.delete(classe)
+    db.commit()
+
+    return {"success": True}

@@ -216,3 +216,21 @@ async def expirer_post_manuellement(post_id: int, data: ExpirerPost, db: Session
     db.commit()
 
     return {"success": True, "post": _serialiser(post, db)}
+
+
+@router.delete("/api/posts/{post_id}")
+async def supprimer_post(post_id: int, session_token: str, db: Session = Depends(get_db)):
+    username = _identite(session_token, db)
+
+    post = db.get(Post, post_id)
+    if post is None:
+        raise HTTPException(status_code=404, detail="Post introuvable")
+    if post.auteur_username != username:
+        raise HTTPException(status_code=403, detail="Seul l'auteur peut supprimer ce post")
+
+    db.query(PostLike).filter(PostLike.post_id == post_id).delete()
+    db.query(PostCommentaire).filter(PostCommentaire.post_id == post_id).delete()
+    db.delete(post)
+    db.commit()
+
+    return {"success": True}
