@@ -135,3 +135,31 @@ class PostCommentaire(Base):
     username = Column(String(64), nullable=False)
     contenu = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AvatarConfig(Base):
+    """Config d'avatar d'un utilisateur — un identifiant d'objet par
+    catégorie, référencé dans le catalogue (avatar_catalogue.py)."""
+    __tablename__ = "avatar_configs"
+
+    username = Column(String(64), primary_key=True)
+    genre = Column(String(32), default="neutre")
+    corps = Column(String(32), default="corps_base")
+    visage = Column(String(32), default="visage_base")
+    cheveux = Column(String(32), default="cheveux_base")
+    vetement = Column(String(32), default="vetement_base")
+    chapeau = Column(String(32), nullable=True)  # optionnel, aucun par défaut
+    lunettes = Column(String(32), nullable=True)
+    couleur_aura = Column(String(16), default="brand")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AvatarDeblocage(Base):
+    """Objets verrouillés qu'un utilisateur a débloqués — vide pour tout
+    le monde tant que le système de monnaie G n'existe pas encore."""
+    __tablename__ = "avatar_deblocages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(64), nullable=False, index=True)
+    item_id = Column(String(32), nullable=False)
+    debloque_le = Column(DateTime(timezone=True), server_default=func.now())
