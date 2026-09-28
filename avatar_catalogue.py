@@ -38,13 +38,21 @@ CATALOGUE = [
     # ---- Lunettes (aucune par défaut = valeur null) ----
     {"id": "lunettes_rondes", "categorie": "lunettes", "nom": "Lunettes rondes", "gratuit": False, "prix_g": 600},
 
+    # ---- Chaussures ----
+    {"id": "chaussures_base", "categorie": "chaussures", "nom": "Baskets simples", "gratuit": True, "prix_g": 0},
+    {"id": "chaussures_montantes", "categorie": "chaussures", "nom": "Montantes stylées", "gratuit": False, "prix_g": 700},
+
+    # ---- Gants (aucun par défaut = mains nues) ----
+    {"id": "gants_cuir", "categorie": "gants", "nom": "Gants en cuir", "gratuit": False, "prix_g": 500},
+    {"id": "gants_sport", "categorie": "gants", "nom": "Gants de sport", "gratuit": False, "prix_g": 500},
+
     # ---- Couleur d'aura (celle qui s'allume quand on parle) ----
     {"id": "brand", "categorie": "couleur_aura", "nom": "Brun/Violet (GRIND)", "gratuit": True, "prix_g": 0},
     {"id": "or", "categorie": "couleur_aura", "nom": "Or légendaire", "gratuit": False, "prix_g": 10000},
 ]
 
-CATEGORIES_OBLIGATOIRES = ("genre", "corps", "visage", "cheveux", "vetement", "couleur_aura")
-CATEGORIES_OPTIONNELLES = ("chapeau", "lunettes")
+CATEGORIES_OBLIGATOIRES = ("genre", "corps", "visage", "cheveux", "vetement", "chaussures", "couleur_aura")
+CATEGORIES_OPTIONNELLES = ("chapeau", "lunettes", "gants")
 
 
 def item_existe(item_id: str, categorie: str) -> bool:

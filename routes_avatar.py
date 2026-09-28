@@ -29,8 +29,10 @@ class AvatarUpdate(BaseModel):
     cheveux: str
     vetement: str
     couleur_aura: str
+    chaussures: str
     chapeau: Optional[str] = None
     lunettes: Optional[str] = None
+    gants: Optional[str] = None
 
 
 def _identite(session_token: str, db: Session) -> str:
@@ -49,15 +51,24 @@ def _est_debloque(db: Session, username: str, item_id: str) -> bool:
 
 
 def _serialiser(config: AvatarConfig) -> dict:
+    """Renvoie toujours une config complète et valide, même pour d'anciennes
+    lignes de la base (colonnes ajoutées après coup = NULL, ou genre stocké
+    sans le préfixe "genre_" par une ancienne version)."""
+    genre = config.genre or "genre_neutre"
+    if not genre.startswith("genre_"):
+        genre = f"genre_{genre}"
+
     return {
-        "genre": config.genre,
-        "corps": config.corps,
-        "visage": config.visage,
-        "cheveux": config.cheveux,
-        "vetement": config.vetement,
+        "genre": genre,
+        "corps": config.corps or "corps_base",
+        "visage": config.visage or "visage_base",
+        "cheveux": config.cheveux or "cheveux_base",
+        "vetement": config.vetement or "vetement_base",
+        "chaussures": config.chaussures or "chaussures_base",
         "chapeau": config.chapeau,
         "lunettes": config.lunettes,
-        "couleur_aura": config.couleur_aura,
+        "gants": config.gants,
+        "couleur_aura": config.couleur_aura or "brand",
     }
 
 
@@ -99,8 +110,9 @@ async def enregistrer_avatar(data: AvatarUpdate, db: Session = Depends(get_db)):
     choix = {
         "genre": data.genre, "corps": data.corps, "visage": data.visage,
         "cheveux": data.cheveux, "vetement": data.vetement, "couleur_aura": data.couleur_aura,
+        "chaussures": data.chaussures,
     }
-    choix_optionnels = {"chapeau": data.chapeau, "lunettes": data.lunettes}
+    choix_optionnels = {"chapeau": data.chapeau, "lunettes": data.lunettes, "gants": data.gants}
 
     for categorie, item_id in choix.items():
         if not item_existe(item_id, categorie):
@@ -129,6 +141,8 @@ async def enregistrer_avatar(data: AvatarUpdate, db: Session = Depends(get_db)):
     config.couleur_aura = data.couleur_aura
     config.chapeau = data.chapeau
     config.lunettes = data.lunettes
+    config.gants = data.gants
+    config.chaussures = data.chaussures
     db.commit()
 
     return {"success": True, "config": _serialiser(config)}

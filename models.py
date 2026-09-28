@@ -143,7 +143,7 @@ class AvatarConfig(Base):
     __tablename__ = "avatar_configs"
 
     username = Column(String(64), primary_key=True)
-    genre = Column(String(32), default="neutre")
+    genre = Column(String(32), default="genre_neutre")
     corps = Column(String(32), default="corps_base")
     visage = Column(String(32), default="visage_base")
     cheveux = Column(String(32), default="cheveux_base")
@@ -151,6 +151,8 @@ class AvatarConfig(Base):
     chapeau = Column(String(32), nullable=True)  # optionnel, aucun par défaut
     lunettes = Column(String(32), nullable=True)
     couleur_aura = Column(String(16), default="brand")
+    chaussures = Column(String(32), default="chaussures_base")
+    gants = Column(String(32), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
