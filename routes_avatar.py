@@ -8,9 +8,10 @@ pourrait poser un item verrouillé en appelant l'API directement,
 contournant complètement le futur système de monnaie G.
 """
 
+import re
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -30,9 +31,18 @@ class AvatarUpdate(BaseModel):
     vetement: str
     couleur_aura: str
     chaussures: str
+    peau: str
+    couleur_cheveux: str
     chapeau: Optional[str] = None
     lunettes: Optional[str] = None
     gants: Optional[str] = None
+
+    @field_validator("peau", "couleur_cheveux")
+    @classmethod
+    def valider_hex(cls, v):
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", v):
+            raise ValueError("Couleur invalide — format attendu #rrggbb")
+        return v
 
 
 def _identite(session_token: str, db: Session) -> str:
@@ -69,6 +79,8 @@ def _serialiser(config: AvatarConfig) -> dict:
         "lunettes": config.lunettes,
         "gants": config.gants,
         "couleur_aura": config.couleur_aura or "brand",
+        "peau": config.peau or "#e8c4a0",
+        "couleur_cheveux": config.couleur_cheveux or "#2a2a35",
     }
 
 
@@ -143,6 +155,8 @@ async def enregistrer_avatar(data: AvatarUpdate, db: Session = Depends(get_db)):
     config.lunettes = data.lunettes
     config.gants = data.gants
     config.chaussures = data.chaussures
+    config.peau = data.peau
+    config.couleur_cheveux = data.couleur_cheveux
     db.commit()
 
     return {"success": True, "config": _serialiser(config)}

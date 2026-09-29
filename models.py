@@ -153,6 +153,8 @@ class AvatarConfig(Base):
     couleur_aura = Column(String(16), default="brand")
     chaussures = Column(String(32), default="chaussures_base")
     gants = Column(String(32), nullable=True)
+    peau = Column(String(9), default="#e8c4a0")
+    couleur_cheveux = Column(String(9), default="#2a2a35")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
