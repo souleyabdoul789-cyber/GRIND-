@@ -18,6 +18,7 @@ from routes_posts import router as router_posts
 from websocket_routes import router as router_ws
 from media import router as router_media
 from routes_avatar import router as router_avatar
+from routes_livekit import router as router_livekit
 
 METERED_TURN_USERNAME = os.getenv("METERED_TURN_USERNAME")
 METERED_TURN_CREDENTIAL = os.getenv("METERED_TURN_CREDENTIAL")
@@ -38,6 +39,7 @@ app.include_router(router_posts)
 app.include_router(router_ws)
 app.include_router(router_media)
 app.include_router(router_avatar)
+app.include_router(router_livekit)
 
 
 @app.on_event("startup")

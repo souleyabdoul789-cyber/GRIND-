@@ -50,6 +50,11 @@ class ClasseRenommer(BaseModel):
     nom: str
 
 
+class ClasseTransfererProf(BaseModel):
+    session_token: str
+    nouveau_prof: str
+
+
 class DemandeAideCreate(BaseModel):
     session_token: str
     sujet: str

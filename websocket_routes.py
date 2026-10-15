@@ -66,6 +66,10 @@ async def ws_session(websocket: WebSocket, demande_id: int, session_token: str =
                 await manager.relay(demande_id, username, msg)
             elif type_ == "etat-micro":
                 await manager.relay(demande_id, username, msg)
+            elif type_ in ("demande-devenir-prof", "reponse-devenir-prof"):
+                await manager.relay(demande_id, username, msg, cible=msg.get("cible"))
+            elif type_ == "prof-change":
+                await manager.relay(demande_id, username, msg)
             elif type_ == "sheet-update":
                 await manager.relay(demande_id, username, msg)
             elif type_ == "demande-voir-feuille":

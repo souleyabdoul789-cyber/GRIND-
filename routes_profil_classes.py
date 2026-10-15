@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from auth_grind import verifier_session
-from schemas import ProfilCreate, ClasseCreate, ClasseRejoindre, ClasseRenommer
+from schemas import ProfilCreate, ClasseCreate, ClasseRejoindre, ClasseRenommer, ClasseTransfererProf
 from models import Profil, Classe, ClasseMembre
 from ws_manager import manager
 
@@ -87,6 +87,10 @@ async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db))
     if deja_membre:
         return {"success": True, "message": "Déjà membre", "classe_id": classe.id}
 
+    nb_membres_actuels = db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count()
+    if nb_membres_actuels >= 10:
+        raise HTTPException(status_code=400, detail="Cette classe a déjà atteint sa limite de 10 élèves")
+
     db.add(ClasseMembre(classe_id=classe.id, username=username, role="membre"))
     db.commit()
 
@@ -112,6 +116,7 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
             "role": m.role,
             "code_invitation": classe.code_invitation,
             "nb_membres": nb_membres,
+            "prof_actuel": classe.createur_username,
         })
 
     return {"classes": resultat}
@@ -131,6 +136,38 @@ async def renommer_classe(classe_id: int, data: ClasseRenommer, db: Session = De
     db.commit()
 
     return {"success": True, "nom": classe.nom}
+
+
+@router.patch("/api/classes/{classe_id}/transferer-prof")
+async def transferer_prof(classe_id: int, data: ClasseTransfererProf, db: Session = Depends(get_db)):
+    """Exécuté par le prof ACTUEL une fois qu'il a accepté une demande
+    (l'échange de la demande elle-même se fait en direct, côté websocket —
+    ceci ne fait que persister la décision en base)."""
+    username = _identite(data.session_token, db)
+
+    classe = db.get(Classe, classe_id)
+    if classe is None:
+        raise HTTPException(status_code=404, detail="Classe introuvable")
+    if classe.createur_username != username:
+        raise HTTPException(status_code=403, detail="Seul le prof actuel peut céder sa place")
+
+    nouveau = db.query(ClasseMembre).filter(
+        ClasseMembre.classe_id == classe_id, ClasseMembre.username == data.nouveau_prof
+    ).first()
+    if nouveau is None:
+        raise HTTPException(status_code=404, detail="Cette personne n'est pas membre de la classe")
+
+    ancien = db.query(ClasseMembre).filter(
+        ClasseMembre.classe_id == classe_id, ClasseMembre.username == username
+    ).first()
+
+    classe.createur_username = data.nouveau_prof
+    nouveau.role = "prof"
+    if ancien:
+        ancien.role = "membre"
+    db.commit()
+
+    return {"success": True, "nouveau_prof": data.nouveau_prof}
 
 
 @router.delete("/api/classes/{classe_id}")
