@@ -51,6 +51,22 @@ async def lire_mon_profil(session_token: str, db: Session = Depends(get_db)):
     }
 
 
+@router.get("/api/profil/de/{username}")
+async def lire_profil_de(username: str, db: Session = Depends(get_db)):
+    """Public — nécessaire pour qu'un pseudo cliqué dans le fil ouvre
+    le profil de son auteur. Rien de sensible dedans (mêmes infos que
+    chacun affiche déjà sur son propre profil)."""
+    profil = db.get(Profil, username)
+    return {
+        "username": username,
+        "profil_existe": profil is not None,
+        "age": profil.age if profil else None,
+        "pays": profil.pays if profil else None,
+        "niveau": profil.niveau if profil else None,
+        "difficultes": profil.difficultes if profil else None,
+    }
+
+
 @router.post("/api/classes")
 async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
     username = _identite(data.session_token, db)
