@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from models import GrindSession
+from moderation import sanction_active
 
 DUREE_SESSION_JOURS = 30
 
@@ -46,4 +47,10 @@ def verifier_session(token: str, db: Session) -> str | None:
         GrindSession.token_hash == token_hash,
         GrindSession.expires_at > datetime.now(timezone.utc),
     ).first()
-    return session.username if session else None
+    if session is None:
+        return None
+    # Un compte suspendu ou banni n'a plus accès à rien : sa session ne vaut plus rien.
+    # (Le message précis lui est donné quand il essaie de se reconnecter.)
+    if sanction_active(db, session.username) is not None:
+        return None
+    return session.username

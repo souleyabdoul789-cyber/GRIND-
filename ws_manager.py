@@ -57,6 +57,16 @@ class ConnectionManager:
         if ws:
             await ws.send_json(payload)
 
+    async def notifier_annonce(self, payload: dict, exclure: str | None = None):
+        """Diffuse une annonce officielle à tous les utilisateurs connectés."""
+        for username, ws in list(self.notif_connections.items()):
+            if username == exclure:
+                continue
+            try:
+                await ws.send_json({**payload, "type": "annonce"})
+            except Exception:
+                self.notif_connections.pop(username, None)
+
     # ---------- Canal de session (aide en cours / classe) ----------
     async def connect_session(self, demande_id: int, username: str, ws: WebSocket):
         await ws.accept()

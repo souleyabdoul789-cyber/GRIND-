@@ -22,6 +22,7 @@ from database import get_db
 from auth_grind import verifier_session
 from schemas import PostCreate, CommentaireCreate, LikeToggle, ResoudrePost, ExpirerPost
 from models import Post, PostLike, PostCommentaire
+from moderation import badge_de
 
 router = APIRouter()
 
@@ -62,6 +63,7 @@ def _serialiser(post: Post, db: Session) -> dict:
         "created_at": post.created_at.isoformat() if post.created_at else None,
         "likes": nb_likes,
         "commentaires": nb_commentaires,
+        "auteur_badge": badge_de(db, post.auteur_username),
     }
 
 
@@ -153,6 +155,7 @@ async def commenter(post_id: int, data: CommentaireCreate, db: Session = Depends
         "commentaire": {
             "id": commentaire.id,
             "username": commentaire.username,
+            "badge": badge_de(db, commentaire.username),
             "contenu": commentaire.contenu,
             "created_at": commentaire.created_at.isoformat() if commentaire.created_at else None,
         },
@@ -171,7 +174,7 @@ async def lister_commentaires(post_id: int, db: Session = Depends(get_db)):
 
     return {
         "commentaires": [
-            {"id": c.id, "username": c.username, "contenu": c.contenu, "created_at": c.created_at.isoformat() if c.created_at else None}
+            {"id": c.id, "username": c.username, "badge": badge_de(db, c.username), "contenu": c.contenu, "created_at": c.created_at.isoformat() if c.created_at else None}
             for c in commentaires
         ]
     }

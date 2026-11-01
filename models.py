@@ -20,6 +20,11 @@ class CompteGrind(Base):
     username = Column(String(64), primary_key=True)
     password_hash = Column(String(128), nullable=False)
     gsociety_username = Column(String(64), nullable=False)  # traçabilité : quel compte G-SOCIETY a validé l'inscription
+    cgu_version = Column(String(16), nullable=True)  # version des CGU acceptée
+    cgu_acceptees_le = Column(DateTime(timezone=True), nullable=True)
+    role = Column(String(16), nullable=True)  # None = élève ; "admin" / "associe" / "controleur"
+    nom_affiche = Column(String(64), nullable=True)  # surtout pour l'admin (choisi à la première entrée)
+    certifie = Column(Integer, nullable=True)  # 1 = badge de certification
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -167,3 +172,51 @@ class AvatarDeblocage(Base):
     username = Column(String(64), nullable=False, index=True)
     item_id = Column(String(32), nullable=False)
     debloque_le = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Signalement(Base):
+    """Un signalement fait par un utilisateur (post, commentaire ou profil).
+    On garde un EXTRAIT du contenu au moment du signalement : même si l'auteur
+    le supprime ensuite, l'administration voit ce qui a été signalé."""
+    __tablename__ = "signalements"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signaleur_username = Column(String(64), nullable=False, index=True)
+    type_cible = Column(String(16), nullable=False)  # "post" / "commentaire" / "profil"
+    cible_id = Column(String(64), nullable=False, index=True)
+    cible_username = Column(String(64), nullable=False, index=True)  # auteur du contenu signalé
+    motif = Column(String(24), nullable=False)
+    details = Column(Text, nullable=True)
+    extrait = Column(Text, nullable=True)
+    statut = Column(String(16), default="ouvert")  # "ouvert" / "traite"
+    decision = Column(String(40), nullable=True)
+    note_admin = Column(Text, nullable=True)
+    traite_par = Column(String(64), nullable=True)
+    traite_le = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Sanction(Base):
+    """Suspension (temporaire) ou bannissement (définitif) d'un compte.
+    levee_le rempli = sanction annulée par l'administration."""
+    __tablename__ = "sanctions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(64), nullable=False, index=True)
+    type = Column(String(16), nullable=False)  # "suspension" / "bannissement"
+    motif = Column(Text, nullable=False)
+    jusqu_a = Column(DateTime(timezone=True), nullable=True)  # None pour un bannissement
+    par = Column(String(64), nullable=False)
+    levee_le = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Annonce(Base):
+    """Annonce officielle publiée par l'administrateur : notification à tous."""
+    __tablename__ = "annonces"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    auteur_username = Column(String(64), nullable=False)
+    titre = Column(String(120), nullable=False)
+    contenu = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
