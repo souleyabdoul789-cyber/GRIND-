@@ -161,3 +161,38 @@ class AdminAnnoncePublier(BaseModel):
 class AdminAnnonceSupprimer(BaseModel):
     session_token: str
     annonce_id: int
+
+
+# ---------- Support (« Contactez-nous ») ----------
+
+class SupportOuvrir(BaseModel):
+    session_token: str
+    message: str
+
+
+class SupportConv(BaseModel):
+    session_token: str
+    conversation_id: int
+
+
+class SupportEnvoyer(BaseModel):
+    session_token: str
+    conversation_id: int
+    message: str
+
+
+class AdminSupportListe(BaseModel):
+    session_token: str
+    statut: str = "ouvert"  # "ouvert" / "clos" / "tous"
+
+
+class AdminSupportRepondre(BaseModel):
+    session_token: str
+    conversation_id: int
+    message: str
+
+
+class AdminSupportIA(BaseModel):
+    session_token: str
+    conversation_id: int
+    active: bool

@@ -57,6 +57,16 @@ class ConnectionManager:
         if ws:
             await ws.send_json(payload)
 
+    async def notifier_utilisateur(self, username: str, payload: dict):
+        """Envoie une notification à un utilisateur précis, s'il est connecté."""
+        ws = self.notif_connections.get(username)
+        if ws is None:
+            return
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            self.notif_connections.pop(username, None)
+
     async def notifier_annonce(self, payload: dict, exclure: str | None = None):
         """Diffuse une annonce officielle à tous les utilisateurs connectés."""
         for username, ws in list(self.notif_connections.items()):

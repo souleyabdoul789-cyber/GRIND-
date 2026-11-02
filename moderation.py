@@ -37,7 +37,7 @@ TOUS_LES_ROLES = (ROLE_ADMIN,) + ROLES_EQUIPE
 
 SUSPENSION_COURTE_MAX_JOURS = 7
 
-_BASE_CONTROLEUR = {"signalements", "utilisateurs", "suspension_courte"}
+_BASE_CONTROLEUR = {"signalements", "utilisateurs", "suspension_courte", "support"}
 _BASE_ASSOCIE = _BASE_CONTROLEUR | {"suspension", "bannissement", "lever_sanction", "certification"}
 PERMISSIONS = {
     ROLE_CONTROLEUR: _BASE_CONTROLEUR,

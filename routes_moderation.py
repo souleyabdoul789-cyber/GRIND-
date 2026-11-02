@@ -51,6 +51,7 @@ from models import (
     Signalement,
     Sanction,
     Annonce,
+    SupportConversation,
 )
 from ws_manager import manager
 
@@ -238,6 +239,9 @@ async def apercu(data: SessionRequest, db: Session = Depends(get_db)):
         "nb_certifies": db.query(CompteGrind).filter(CompteGrind.certifie == 1).count(),
         "nb_equipe": db.query(CompteGrind).filter(CompteGrind.role.in_(ROLES_EQUIPE)).count(),
         "nb_annonces": db.query(Annonce).count(),
+        "nb_support_attente": db.query(SupportConversation).filter(
+            SupportConversation.statut == "ouvert", SupportConversation.attente_equipe == 1
+        ).count(),
     }
 
 

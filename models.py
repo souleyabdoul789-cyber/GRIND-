@@ -220,3 +220,29 @@ class Annonce(Base):
     titre = Column(String(120), nullable=False)
     contenu = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class SupportConversation(Base):
+    """Une discussion « Contactez-nous » entre un élève, l'assistant IA et l'équipe."""
+    __tablename__ = "support_conversations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(64), nullable=False, index=True)
+    statut = Column(String(12), default="ouvert")  # "ouvert" / "clos"
+    ia_active = Column(Integer, default=1)  # 1 = l'assistant répond ; 0 = en pause (un humain a la main)
+    humain_demande = Column(Integer, default=0)  # l'élève veut parler à l'équipe
+    urgent = Column(Integer, default=0)  # message signalant un danger : à lire en premier
+    attente_equipe = Column(Integer, default=0)  # 1 = l'équipe doit répondre
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class SupportMessage(Base):
+    __tablename__ = "support_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(Integer, nullable=False, index=True)
+    auteur_type = Column(String(12), nullable=False)  # "utilisateur" / "ia" / "equipe" / "systeme"
+    auteur_username = Column(String(64), nullable=True)
+    contenu = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

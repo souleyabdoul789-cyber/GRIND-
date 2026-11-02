@@ -20,6 +20,7 @@ from media import router as router_media
 from routes_avatar import router as router_avatar
 from routes_livekit import router as router_livekit
 from routes_moderation import router as router_moderation
+from routes_support import router as router_support
 
 METERED_TURN_USERNAME = os.getenv("METERED_TURN_USERNAME")
 METERED_TURN_CREDENTIAL = os.getenv("METERED_TURN_CREDENTIAL")
@@ -42,6 +43,7 @@ app.include_router(router_media)
 app.include_router(router_avatar)
 app.include_router(router_livekit)
 app.include_router(router_moderation)
+app.include_router(router_support)
 
 
 @app.on_event("startup")
