@@ -21,13 +21,14 @@ Pour la changer : générer une nouvelle clé, remplacer l'empreinte sur Render.
 import hashlib
 import hmac
 import os
+import secrets
 from datetime import datetime, timezone
 
-from models import Sanction, CompteGrind
+from models import Sanction, CompteGrind, Examen, Blocage
 
 # À changer quand le texte des CGU change : tous les comptes devront
 # alors les accepter de nouveau à leur prochaine connexion.
-CGU_VERSION = "2026-10-31"
+CGU_VERSION = "2026-11-02"
 
 ROLE_ADMIN = "admin"
 ROLE_ASSOCIE = "associe"
@@ -38,7 +39,7 @@ TOUS_LES_ROLES = (ROLE_ADMIN,) + ROLES_EQUIPE
 SUSPENSION_COURTE_MAX_JOURS = 7
 
 _BASE_CONTROLEUR = {"signalements", "utilisateurs", "suspension_courte", "support"}
-_BASE_ASSOCIE = _BASE_CONTROLEUR | {"suspension", "bannissement", "lever_sanction", "certification"}
+_BASE_ASSOCIE = _BASE_CONTROLEUR | {"suspension", "bannissement", "lever_sanction", "certification", "examens"}
 PERMISSIONS = {
     ROLE_CONTROLEUR: _BASE_CONTROLEUR,
     ROLE_ASSOCIE: _BASE_ASSOCIE,
@@ -114,9 +115,66 @@ def sanction_active(db, username: str):
     return None
 
 
+def usernames_sanctionnes(db) -> set:
+    """Tous les comptes sous sanction en ce moment. Leurs contenus et leurs classes sont
+    MASQUÉS (pas supprimés) : les traces sont gardées, et tout revient si la sanction est levée."""
+    maintenant = datetime.now(timezone.utc)
+    resultat = set()
+    for s in db.query(Sanction).filter(Sanction.levee_le.is_(None)).all():
+        if s.type == "bannissement":
+            resultat.add(s.username)
+            continue
+        fin = _avec_fuseau(s.jusqu_a)
+        if fin is None or fin > maintenant:
+            resultat.add(s.username)
+    return resultat
+
+
+def bloques_par(db, username: str) -> set:
+    """Les comptes que cet utilisateur ne veut plus voir."""
+    return {b.bloque_username for b in db.query(Blocage).filter(Blocage.bloqueur_username == username).all()}
+
+
+def etat_examen(db, sanction):
+    examen = db.query(Examen).filter(Examen.sanction_id == sanction.id).first()
+    if examen is None:
+        return None
+    return {
+        "statut": examen.statut,  # "en_attente" / "accepte" / "refuse"
+        "note": examen.note_admin if examen.statut != "en_attente" else None,
+    }
+
+
+def detail_sanction(db, sanction, emettre_jeton: bool = False) -> dict:
+    """Ce qu'on montre à la personne sanctionnée (écran « Ce compte ne peut plus... »).
+
+    Le jeton d'examen est donné UNIQUEMENT à une connexion réussie (mot de passe correct) :
+    il ne permet rien d'autre que consulter l'état de la décision et demander l'examen.
+    Le serveur n'en garde que l'empreinte."""
+    examen = etat_examen(db, sanction)
+    fin = _avec_fuseau(sanction.jusqu_a)
+    detail = {
+        "code": "sanction",
+        "type": sanction.type,
+        "message": message_sanction(sanction),
+        "motif": sanction.motif,
+        "jusqu_a": fin.isoformat() if fin else None,
+        # une seule demande par décision : refusée, elle est définitive
+        "examen_possible": bool(sanction.examen_possible) and examen is None,
+        "examen": examen,
+        "jeton_examen": None,
+    }
+    if emettre_jeton and (bool(sanction.examen_possible) or examen is not None):
+        jeton = secrets.token_urlsafe(32)
+        sanction.jeton_examen_hash = hashlib.sha256(jeton.encode()).hexdigest()
+        db.commit()
+        detail["jeton_examen"] = jeton
+    return detail
+
+
 def message_sanction(sanction) -> str:
     if sanction.type == "bannissement":
-        return f"Ce compte a été banni de GRIND. Motif : {sanction.motif}"
+        return "Ce compte a été banni de GRIND"
     fin = _avec_fuseau(sanction.jusqu_a)
     date = fin.strftime("%d/%m/%Y à %H:%M UTC") if fin else "une date indéterminée"
-    return f"Ce compte est suspendu jusqu'au {date}. Motif : {sanction.motif}"
+    return f"Ce compte est suspendu jusqu'au {date}"

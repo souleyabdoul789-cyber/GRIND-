@@ -22,7 +22,7 @@ from database import get_db
 from auth_grind import verifier_session
 from schemas import PostCreate, CommentaireCreate, LikeToggle, ResoudrePost, ExpirerPost
 from models import Post, PostLike, PostCommentaire
-from moderation import badge_de
+from moderation import badge_de, usernames_sanctionnes, bloques_par
 
 router = APIRouter()
 
@@ -102,7 +102,7 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/api/posts")
-async def lister_posts(categorie: str | None = None, db: Session = Depends(get_db)):
+async def lister_posts(categorie: str | None = None, session_token: str | None = None, db: Session = Depends(get_db)):
     query = db.query(Post)
     if categorie:
         if categorie not in CATEGORIES_VALIDES:
@@ -110,6 +110,12 @@ async def lister_posts(categorie: str | None = None, db: Session = Depends(get_d
         query = query.filter(Post.categorie == categorie)
 
     posts = query.order_by(Post.created_at.desc()).all()
+    # Contenus masqués : comptes sanctionnés (traces gardées) et comptes que le lecteur ne veut plus voir.
+    masques = usernames_sanctionnes(db)
+    lecteur = verifier_session(session_token, db) if session_token else None
+    if lecteur:
+        masques |= bloques_par(db, lecteur)
+    posts = [p for p in posts if p.auteur_username not in masques]
     posts = [_appliquer_expiration_si_necessaire(p, db) for p in posts]
 
     return {"posts": [_serialiser(p, db) for p in posts]}
@@ -163,7 +169,7 @@ async def commenter(post_id: int, data: CommentaireCreate, db: Session = Depends
 
 
 @router.get("/api/posts/{post_id}/commentaires")
-async def lister_commentaires(post_id: int, db: Session = Depends(get_db)):
+async def lister_commentaires(post_id: int, session_token: str | None = None, db: Session = Depends(get_db)):
     post = db.get(Post, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post introuvable")
@@ -171,6 +177,12 @@ async def lister_commentaires(post_id: int, db: Session = Depends(get_db)):
     commentaires = db.query(PostCommentaire).filter(
         PostCommentaire.post_id == post_id
     ).order_by(PostCommentaire.created_at.asc()).all()
+
+    masques = usernames_sanctionnes(db)
+    lecteur = verifier_session(session_token, db) if session_token else None
+    if lecteur:
+        masques |= bloques_par(db, lecteur)
+    commentaires = [c for c in commentaires if c.username not in masques]
 
     return {
         "commentaires": [

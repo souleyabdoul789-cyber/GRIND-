@@ -207,6 +207,8 @@ class Sanction(Base):
     motif = Column(Text, nullable=False)
     jusqu_a = Column(DateTime(timezone=True), nullable=True)  # None pour un bannissement
     par = Column(String(64), nullable=False)
+    examen_possible = Column(Integer, nullable=True)  # 1 = l'administration autorise une demande d'examen
+    jeton_examen_hash = Column(String(64), nullable=True)  # empreinte du jeton donné à la connexion pour demander l'examen
     levee_le = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -245,4 +247,30 @@ class SupportMessage(Base):
     auteur_type = Column(String(12), nullable=False)  # "utilisateur" / "ia" / "equipe" / "systeme"
     auteur_username = Column(String(64), nullable=True)
     contenu = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Examen(Base):
+    """Demande d'examen d'une sanction. Une seule par décision : si elle est refusée,
+    la décision est définitive."""
+    __tablename__ = "examens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sanction_id = Column(Integer, nullable=False, index=True)
+    username = Column(String(64), nullable=False, index=True)
+    message = Column(Text, nullable=False)
+    statut = Column(String(12), default="en_attente")  # "en_attente" / "accepte" / "refuse"
+    note_admin = Column(Text, nullable=True)
+    traite_par = Column(String(64), nullable=True)
+    traite_le = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Blocage(Base):
+    """« Ne plus voir ses contenus » : décision personnelle d'un utilisateur, sans effet sur l'autre."""
+    __tablename__ = "blocages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    bloqueur_username = Column(String(64), nullable=False, index=True)
+    bloque_username = Column(String(64), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -115,6 +115,7 @@ class AdminTraiter(BaseModel):
     supprimer_contenu: bool = False
     duree_jours: Optional[int] = None
     note: Optional[str] = None
+    examen_possible: bool = False  # suspension / bannissement : autoriser une demande d'examen
 
 
 class AdminRechercheUtilisateurs(BaseModel):
@@ -128,6 +129,7 @@ class AdminSanctionner(BaseModel):
     type: str  # "suspension" / "bannissement"
     duree_jours: Optional[int] = None
     motif: str
+    examen_possible: bool = False
 
 
 class AdminLever(BaseModel):
@@ -196,3 +198,54 @@ class AdminSupportIA(BaseModel):
     session_token: str
     conversation_id: int
     active: bool
+
+
+# ---------- Blocage, examen, contenus ----------
+
+class BlocageAction(BaseModel):
+    session_token: str
+    username: str
+
+
+class ExamenEtat(BaseModel):
+    username: str
+    jeton_examen: str
+
+
+class ExamenDemander(BaseModel):
+    username: str
+    jeton_examen: str
+    message: str
+
+
+class AdminExamens(BaseModel):
+    session_token: str
+    statut: str = "en_attente"  # "en_attente" / "traite" / "tous"
+
+
+class AdminExamenDossier(BaseModel):
+    session_token: str
+    examen_id: int
+
+
+class AdminExamenTraiter(BaseModel):
+    session_token: str
+    examen_id: int
+    decision: str  # "accepter" / "refuser"
+    note: Optional[str] = None
+
+
+class AdminSupprimerContenu(BaseModel):
+    session_token: str
+    type_cible: str  # "post" / "commentaire"
+    cible_id: str
+
+
+class AdminToutSupprimer(BaseModel):
+    session_token: str
+    username: str
+
+
+class AdminSupprimerClasse(BaseModel):
+    session_token: str
+    classe_id: int

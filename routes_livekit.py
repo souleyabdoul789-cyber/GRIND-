@@ -22,7 +22,8 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from auth_grind import verifier_session
-from models import ClasseMembre
+from models import ClasseMembre, Classe
+from moderation import sanction_active
 
 router = APIRouter()
 
@@ -52,6 +53,10 @@ async def obtenir_jeton_livekit(data: LiveKitTokenRequest, db: Session = Depends
     ).first()
     if not est_membre:
         raise HTTPException(status_code=403, detail="Tu n'es pas membre de cette classe")
+
+    classe = db.get(Classe, data.classe_id)
+    if classe is not None and sanction_active(db, classe.createur_username) is not None:
+        raise HTTPException(status_code=403, detail="Cette classe est suspendue")
 
     if not all([LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL]):
         raise HTTPException(status_code=500, detail="LiveKit non configuré côté serveur")

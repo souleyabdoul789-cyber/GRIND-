@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from auth_grind import verifier_session
 from schemas import ProfilCreate, ClasseCreate, ClasseRejoindre, ClasseRenommer, ClasseTransfererProf
-from moderation import badge_de
+from moderation import badge_de, sanction_active
 from models import Profil, Classe, ClasseMembre
 from ws_manager import manager
 
@@ -61,6 +61,7 @@ async def lire_profil_de(username: str, db: Session = Depends(get_db)):
     return {
         "username": username,
         "badge": badge_de(db, username),
+        "sanctionne": sanction_active(db, username) is not None,
         "profil_existe": profil is not None,
         "age": profil.age if profil else None,
         "pays": profil.pays if profil else None,
@@ -97,6 +98,9 @@ async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db))
     classe = db.query(Classe).filter(Classe.code_invitation == data.code_invitation).first()
     if classe is None:
         raise HTTPException(status_code=404, detail="Lien d'invitation invalide")
+
+    if sanction_active(db, classe.createur_username) is not None:
+        raise HTTPException(status_code=403, detail="Cette classe est suspendue")
 
     deja_membre = db.query(ClasseMembre).filter(
         ClasseMembre.classe_id == classe.id,
@@ -135,6 +139,7 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
             "code_invitation": classe.code_invitation,
             "nb_membres": nb_membres,
             "prof_actuel": classe.createur_username,
+            "suspendue": sanction_active(db, classe.createur_username) is not None,
         })
 
     return {"classes": resultat}

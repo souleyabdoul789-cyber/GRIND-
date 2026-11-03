@@ -22,7 +22,7 @@ from models import CompteGrind
 from auth_grind import hacher_mot_de_passe, verifier_mot_de_passe, creer_session
 from moderation import (
     ADMIN_USERNAME, CGU_VERSION, ROLE_ADMIN,
-    cle_admin_valide, nom_reserve, sanction_active, message_sanction,
+    cle_admin_valide, nom_reserve, sanction_active, detail_sanction,
 )
 from limiteur import trop_d_echecs, noter_echec, oublier
 from datetime import datetime, timezone
@@ -118,7 +118,9 @@ async def login(data: CompteGrindLogin, request: Request, db: Session = Depends(
 
     sanction = sanction_active(db, compte.username)
     if sanction is not None:
-        raise HTTPException(status_code=403, detail=message_sanction(sanction))
+        # Mot de passe correct, mais compte sanctionné : on renvoie le détail structuré
+        # (écran « Ce compte ne peut plus... », demande d'examen si l'administration l'autorise).
+        raise HTTPException(status_code=403, detail=detail_sanction(db, sanction, emettre_jeton=True))
 
     oublier(ip)
     token = creer_session(compte.username, db)
@@ -129,19 +131,3 @@ async def login(data: CompteGrindLogin, request: Request, db: Session = Depends(
         "role": compte.role,
         "nom_affiche": compte.nom_affiche,
     }
-
-
-@router.post("/api/compte/changer-mot-de-passe")
-async def changer_mot_de_passe(data: ChangerMotDePasse, db: Session = Depends(get_db)):
-    from auth_grind import verifier_session
-    username = verifier_session(data.session_token, db)
-    if username is None:
-        raise HTTPException(status_code=401, detail="Session GRIND invalide ou expirée")
-
-    compte = db.get(CompteGrind, username)
-    if not verifier_mot_de_passe(data.ancien_mot_de_passe, compte.password_hash):
-        raise HTTPException(status_code=401, detail="Ancien mot de passe incorrect")
-
-    compte.password_hash = hacher_mot_de_passe(data.nouveau_mot_de_passe)
-    db.commit()
-    return {"success": True, "message": "Mot de passe changé"}
