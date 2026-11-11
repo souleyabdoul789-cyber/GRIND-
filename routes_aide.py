@@ -7,6 +7,7 @@ from schemas import DemandeAideCreate, AideAccepter
 from models import DemandeAide, AideParticipant
 from ws_manager import manager
 from matching import trouver_meilleurs_candidats
+from scolaire import ErreurValidation, valider_matiere
 
 router = APIRouter()
 
@@ -22,16 +23,21 @@ def _identite(session_token: str, db: Session) -> str:
 async def demander_aide(data: DemandeAideCreate, db: Session = Depends(get_db)):
     username = _identite(data.session_token, db)
 
+    try:
+        sujet = valider_matiere(data.sujet)  # matière du catalogue, normalisée (pas de texte absurde)
+    except ErreurValidation as erreur:
+        raise HTTPException(status_code=400, detail=str(erreur))
+
     demande = DemandeAide(
         demandeur_username=username,
-        sujet=data.sujet,
+        sujet=sujet,
         description=data.description,
     )
     db.add(demande)
     db.commit()
     db.refresh(demande)
 
-    candidats = trouver_meilleurs_candidats(db, username, data.sujet)
+    candidats = trouver_meilleurs_candidats(db, username, sujet)
     await manager.notifier_nouvelle_demande(demande.id, demande.sujet, username, candidats)
 
     return {"success": True, "demande_id": demande.id, "candidats_notifies": len(candidats)}

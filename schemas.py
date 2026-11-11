@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Any, Optional
 
 # session_token = identité GRIND (obtenue au login GRIND), utilisée
 # partout SAUF à l'inscription, où api_key = clé G-SOCIETY catégorie
@@ -8,6 +8,7 @@ from typing import Optional
 
 class CompteGrindSignup(BaseModel):
     username: str
+    email: str
     password: str
     api_key: str  # clé G-SOCIETY catégorie "grind", générée sur le site G-SOCIETY
     cgu_acceptees: bool = False  # case "J'accepte les CGU" cochée à l'inscription
@@ -33,12 +34,14 @@ class ProfilCreate(BaseModel):
     age: int
     pays: str
     niveau: str
-    difficultes: Optional[str] = None
+    difficultes: Optional[Any] = None  # liste de matières (ou ancien format texte)
 
 
 class ClasseCreate(BaseModel):
     session_token: str
-    nom: str
+    niveau: Optional[str] = None  # catalogue scolaire (obligatoire côté serveur)
+    matiere: Optional[str] = None
+    complement: Optional[str] = None  # partie libre du nom, facultative
 
 
 class ClasseRejoindre(BaseModel):
@@ -249,3 +252,33 @@ class AdminToutSupprimer(BaseModel):
 class AdminSupprimerClasse(BaseModel):
     session_token: str
     classe_id: int
+
+
+class AdminSupportDiag(BaseModel):
+    session_token: str
+    tester: bool = False  # True = faire un vrai essai auprès de Groq
+
+
+# ---------- Authentification : e-mail, vérification, mot de passe oublié ----------
+
+class VerifierCode(BaseModel):
+    jeton_verification: str
+    code: str
+
+
+class JetonVerification(BaseModel):
+    jeton_verification: str
+
+
+class AssocierEmail(BaseModel):
+    jeton_verification: str
+    email: str
+
+
+class MotDePasseOublie(BaseModel):
+    email: str
+
+
+class ReinitialiserMotDePasse(BaseModel):
+    jeton_verification: str
+    mot_de_passe: str

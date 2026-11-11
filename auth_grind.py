@@ -33,9 +33,25 @@ def creer_session(username: str, db: Session) -> str:
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     expiration = datetime.now(timezone.utc) + timedelta(days=DUREE_SESSION_JOURS)
 
+    # Ménage : sessions expirées de ce compte, et au plus 10 appareils connectés (les plus anciens sont déconnectés).
+    maintenant = datetime.now(timezone.utc)
+    db.query(GrindSession).filter(GrindSession.username == username, GrindSession.expires_at < maintenant).delete()
+    actives = (
+        db.query(GrindSession).filter(GrindSession.username == username).order_by(GrindSession.created_at.asc()).all()
+    )
+    for ancienne in actives[: max(0, len(actives) - 9)]:
+        db.delete(ancienne)
+
     db.add(GrindSession(token_hash=token_hash, username=username, expires_at=expiration))
     db.commit()
     return token
+
+
+def supprimer_session(token: str, db: Session) -> None:
+    """Déconnexion RÉELLE : la session disparaît côté serveur (le jeton ne sert plus à rien, même volé)."""
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    db.query(GrindSession).filter(GrindSession.token_hash == token_hash).delete()
+    db.commit()
 
 
 def verifier_session(token: str, db: Session) -> str | None:

@@ -25,6 +25,12 @@ class CompteGrind(Base):
     role = Column(String(16), nullable=True)  # None = élève ; "admin" / "associe" / "controleur"
     nom_affiche = Column(String(64), nullable=True)  # surtout pour l'admin (choisi à la première entrée)
     certifie = Column(Integer, nullable=True)  # 1 = badge de certification
+    # E-mail : unique par compte. email_verifie : 1 = vérifié ; 0 = inscription récente non vérifiée
+    # (supprimée au bout d'1 h) ; NULL = ancien compte sans e-mail vérifié (invité à le faire à la connexion).
+    email = Column(String(254), nullable=True)
+    email_canonique = Column(String(254), nullable=True, index=True)  # sert à l'unicité (gmail : points/+ ignorés)
+    email_verifie = Column(Integer, nullable=True)
+    email_verifie_le = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -61,6 +67,9 @@ class Classe(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     nom = Column(String(128), nullable=False)  # affichage seulement, pas une clé
+    niveau = Column(String(32), nullable=True)  # catalogue scolaire (None pour les anciennes classes)
+    matiere = Column(String(64), nullable=True)
+    complement = Column(String(40), nullable=True)  # partie libre du nom, contrôlée
     code_invitation = Column(String(32), unique=True, nullable=False, index=True)
     createur_username = Column(String(64), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -273,4 +282,28 @@ class Blocage(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     bloqueur_username = Column(String(64), nullable=False, index=True)
     bloque_username = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class VerificationEmail(Base):
+    """Un « flux » de vérification d'e-mail (inscription) ou de réinitialisation de mot de passe.
+    Voir verification.py : le code n'est gardé que sous forme d'empreinte salée."""
+    __tablename__ = "verifications_email"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    objet = Column(String(20), nullable=False)  # "inscription" / "reinitialisation"
+    username = Column(String(64), nullable=True, index=True)
+    email = Column(String(254), nullable=True)
+    jeton_hash = Column(String(64), unique=True, nullable=False, index=True)
+    code_hash = Column(String(64), nullable=True)
+    code_sel = Column(String(32), nullable=True)
+    tentatives = Column(Integer, default=0)
+    nb_envois = Column(Integer, default=0)
+    dernier_envoi_le = Column(DateTime(timezone=True), nullable=True)
+    expire_le = Column(DateTime(timezone=True), nullable=True)  # expiration du code courant
+    flux_expire_le = Column(DateTime(timezone=True), nullable=False)  # expiration de la démarche entière
+    code_valide_le = Column(DateTime(timezone=True), nullable=True)  # réinitialisation : code validé
+    utilise_le = Column(DateTime(timezone=True), nullable=True)
+    fantome = Column(Integer, default=0)  # 1 = faux flux (adresse inconnue / déjà utilisée) : ne peut jamais aboutir
+    ip = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

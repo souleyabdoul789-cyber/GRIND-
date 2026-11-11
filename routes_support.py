@@ -31,6 +31,7 @@ from schemas import (
     AdminSupportListe,
     AdminSupportRepondre,
     AdminSupportIA,
+    AdminSupportDiag,
 )
 from models import SupportConversation, SupportMessage
 from ws_manager import manager
@@ -346,3 +347,13 @@ async def cloturer_equipe(data: SupportConv, db: Session = Depends(get_db)):
         _ajouter(db, conv, "systeme", None, "Discussion terminée par l'équipe.")
         db.commit()
     return {"conversation": _resume(db, conv), "messages": _messages(db, conv.id)}
+
+
+@router.post("/api/admin/support/assistant")
+async def etat_assistant(data: AdminSupportDiag, db: Session = Depends(get_db)):
+    """État de l'assistant IA pour l'équipe : dernier résultat connu, ou un vrai essai si `tester`.
+    Dit clairement pourquoi il se tait (clé absente, clé refusée, modèle retiré, quota, panne)."""
+    _equipe(data.session_token, db)
+    if data.tester:
+        return await assistant_ia.diagnostiquer()
+    return assistant_ia.dernier_etat()

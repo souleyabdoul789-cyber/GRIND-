@@ -1,3 +1,5 @@
+import json
+import re
 import secrets
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -6,6 +8,10 @@ from database import get_db
 from auth_grind import verifier_session
 from schemas import ProfilCreate, ClasseCreate, ClasseRejoindre, ClasseRenommer, ClasseTransfererProf
 from moderation import badge_de, sanction_active
+from scolaire import (
+    ErreurValidation, valider_age, valider_niveau, valider_difficultes, valider_texte_libre,
+    valider_classe, cle_doublon_classe, composer_nom_classe,
+)
 from models import Profil, Classe, ClasseMembre
 from ws_manager import manager
 
@@ -28,10 +34,20 @@ async def creer_ou_maj_profil(data: ProfilCreate, db: Session = Depends(get_db))
         profil = Profil(username=username)
         db.add(profil)
 
-    profil.age = data.age
-    profil.pays = data.pays
-    profil.niveau = data.niveau
-    profil.difficultes = data.difficultes
+    # Validation SERVEUR de toutes les données scolaires : rien d'absurde n'entre dans la base.
+    try:
+        age = valider_age(data.age)
+        niveau = valider_niveau(data.niveau)
+        pays = (data.pays or "").strip()
+        pays = pays.lower() if re.fullmatch(r"[A-Za-z]{2}", pays) else valider_texte_libre(pays, min_len=2, max_len=40, nom="Le pays")
+        difficultes = valider_difficultes(data.difficultes, niveau)
+    except ErreurValidation as erreur:
+        raise HTTPException(status_code=400, detail=str(erreur))
+
+    profil.age = age
+    profil.pays = pays
+    profil.niveau = niveau["label"]
+    profil.difficultes = json.dumps(difficultes, ensure_ascii=False)
     db.commit()
 
     return {"success": True, "message": "Profil enregistré"}
@@ -74,8 +90,22 @@ async def lire_profil_de(username: str, db: Session = Depends(get_db)):
 async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
     username = _identite(data.session_token, db)
 
+    try:
+        valide = valider_classe(data.niveau or "", data.matiere or "", data.complement)
+    except ErreurValidation as erreur:
+        raise HTTPException(status_code=400, detail=str(erreur))
+
+    existantes = db.query(Classe).filter(Classe.createur_username == username).all()
+    if len(existantes) >= 10:
+        raise HTTPException(status_code=400, detail="Tu as atteint la limite de 10 classes.")
+    if any(cle_doublon_classe(c.nom) == cle_doublon_classe(valide["nom"]) for c in existantes):
+        raise HTTPException(status_code=400, detail="Tu as déjà une classe avec ce nom.")
+
     code = secrets.token_urlsafe(8)
-    classe = Classe(nom=data.nom, code_invitation=code, createur_username=username)
+    classe = Classe(
+        nom=valide["nom"], niveau=valide["niveau"], matiere=valide["matiere"], complement=valide["complement"],
+        code_invitation=code, createur_username=username,
+    )
     db.add(classe)
     db.commit()
     db.refresh(classe)
@@ -140,6 +170,9 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
             "nb_membres": nb_membres,
             "prof_actuel": classe.createur_username,
             "suspendue": sanction_active(db, classe.createur_username) is not None,
+            "niveau": classe.niveau,
+            "matiere": classe.matiere,
+            "complement": classe.complement,
         })
 
     return {"classes": resultat}
@@ -155,7 +188,24 @@ async def renommer_classe(classe_id: int, data: ClasseRenommer, db: Session = De
     if classe.createur_username != username:
         raise HTTPException(status_code=403, detail="Seul le créateur peut renommer cette classe")
 
-    classe.nom = data.nom
+    try:
+        if classe.niveau and classe.matiere:
+            # Classe structurée : on ne change que le complément ; niveau et matière restent cohérents.
+            complement = valider_texte_libre(data.nom, min_len=2, max_len=30, nom="Le complément du nom") if (data.nom or "").strip() else None
+            nouveau_nom = composer_nom_classe(classe.matiere, classe.niveau, complement)
+        else:
+            complement = None
+            nouveau_nom = valider_texte_libre(data.nom, min_len=3, max_len=60, nom="Le nom de la classe")
+    except ErreurValidation as erreur:
+        raise HTTPException(status_code=400, detail=str(erreur))
+
+    autres = db.query(Classe).filter(Classe.createur_username == username, Classe.id != classe.id).all()
+    if any(cle_doublon_classe(c.nom) == cle_doublon_classe(nouveau_nom) for c in autres):
+        raise HTTPException(status_code=400, detail="Tu as déjà une classe avec ce nom.")
+
+    classe.nom = nouveau_nom
+    if classe.niveau and classe.matiere:
+        classe.complement = complement
     db.commit()
 
     return {"success": True, "nom": classe.nom}

@@ -28,7 +28,7 @@ from models import Sanction, CompteGrind, Examen, Blocage
 
 # À changer quand le texte des CGU change : tous les comptes devront
 # alors les accepter de nouveau à leur prochaine connexion.
-CGU_VERSION = "2026-11-02"
+CGU_VERSION = "2026-11-03"
 
 ROLE_ADMIN = "admin"
 ROLE_ASSOCIE = "associe"

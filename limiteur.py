@@ -33,3 +33,19 @@ def noter_echec(ip: str) -> None:
 
 def oublier(ip: str) -> None:
     _echecs.pop(ip, None)
+
+
+_compteurs: dict[str, deque] = defaultdict(deque)
+
+
+def autoriser(cle: str, maximum: int, fenetre_secondes: int) -> bool:
+    """Compte une action (inscription, demande de code...) et dit si elle est encore permise :
+    au plus `maximum` fois par fenêtre glissante. Renvoie False — sans compter — quand la limite est atteinte."""
+    maintenant = time.time()
+    file = _compteurs[cle]
+    while file and file[0] < maintenant - fenetre_secondes:
+        file.popleft()
+    if len(file) >= maximum:
+        return False
+    file.append(maintenant)
+    return True
