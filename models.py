@@ -372,6 +372,7 @@ class NotificationGrind(Base):
     commentaire_id = Column(Integer, nullable=True)
     resource_type = Column(String(32), nullable=True)
     resource_id = Column(Integer, nullable=True)
+    classe_id = Column(Integer, nullable=True, index=True)
     extrait = Column(String(240), nullable=True)
     lu = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -430,3 +431,66 @@ class CountryAccessBlock(Base):
     actif = Column(Integer, nullable=False, default=1)
     modifie_par = Column(String(64), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ClasseDiscussion(Base):
+    """Discussion de groupe associée à une classe réelle, mais avec son propre plafond."""
+    __tablename__ = "classe_discussions"
+    __table_args__ = (UniqueConstraint("classe_id", name="uq_classe_discussion_classe"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    classe_id = Column(Integer, ForeignKey("classes.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner_username = Column(String(64), nullable=False)
+    nom = Column(String(128), nullable=False)
+    photo_url = Column(String(700), nullable=True)
+    code_invitation = Column(String(48), nullable=False, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClasseDiscussionMembre(Base):
+    """Adhésion au groupe de discussion (200 max), indépendante des 10 sièges de la classe."""
+    __tablename__ = "classe_discussion_membres"
+    __table_args__ = (UniqueConstraint("discussion_id", "username", name="uq_discussion_membre"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    discussion_id = Column(Integer, ForeignKey("classe_discussions.id", ondelete="CASCADE"), nullable=False, index=True)
+    username = Column(String(64), nullable=False, index=True)
+    role = Column(String(16), nullable=False, default="membre")  # owner / admin / membre
+    restreint = Column(Integer, nullable=False, default=0)
+    restriction_jusqua = Column(DateTime(timezone=True), nullable=True)  # NULL + restreint=1 : jusqu'à levée manuelle
+    # actif=0 conserve le fait qu'un membre a quitté ou a été retiré.
+    # banni=1 interdit une nouvelle entrée via le code d'invitation.
+    actif = Column(Integer, nullable=True, default=1)
+    banni = Column(Integer, nullable=True, default=0)
+    dernier_message_lu_id = Column(Integer, nullable=True, default=0)
+    joined_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClasseDiscussionMessage(Base):
+    """Message persistant du groupe de classe."""
+    __tablename__ = "classe_discussion_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    discussion_id = Column(Integer, ForeignKey("classe_discussions.id", ondelete="CASCADE"), nullable=False, index=True)
+    auteur_username = Column(String(64), nullable=False, index=True)
+    contenu = Column(Text, nullable=False, default="")
+    reply_to_id = Column(Integer, ForeignKey("classe_discussion_messages.id", ondelete="SET NULL"), nullable=True, index=True)
+    style_texte = Column(String(16), nullable=False, default="normal")  # normal / serif / mono
+    piece_url = Column(String(900), nullable=True)
+    piece_type = Column(String(16), nullable=True)  # image / video / document
+    piece_nom = Column(String(180), nullable=True)
+    piece_mime = Column(String(120), nullable=True)
+    piece_taille = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClasseDiscussionMention(Base):
+    """Une occurrence de mention par message et destinataire."""
+    __tablename__ = "classe_discussion_mentions"
+    __table_args__ = (UniqueConstraint("message_id", "username", name="uq_discussion_mention"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message_id = Column(Integer, ForeignKey("classe_discussion_messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    username = Column(String(64), nullable=False, index=True)
+    lu = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

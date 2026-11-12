@@ -529,7 +529,7 @@ async def lister_notifications(session_token: str, db: Session = Depends(get_db)
         notifications.append({"id": n.id, "type": n.type, "acteur": n.acteur_username,
             "acteur_nom": " ".join(x for x in [acteur.prenom, acteur.nom] if x).strip() if acteur else n.acteur_username,
             "post_id": n.post_id, "commentaire_id": n.commentaire_id,
-            "resource_type": n.resource_type, "resource_id": n.resource_id,
+            "resource_type": n.resource_type, "resource_id": n.resource_id, "classe_id": getattr(n, "classe_id", None),
             "extrait": n.extrait, "lu": bool(n.lu), "created_at": n.created_at.isoformat() if n.created_at else None})
     return {"notifications": notifications}
 

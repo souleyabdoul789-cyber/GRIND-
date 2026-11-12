@@ -13,7 +13,9 @@ from scolaire import (
     valider_texte_libre, valider_classe, cle_doublon_classe, composer_nom_classe,
 )
 from models_proviseur import ProviseurCandidature, ProviseurAutorisation, Etablissement
-from models import Profil, Classe, ClasseMembre, CompteGrind
+from models import (Profil, Classe, ClasseMembre, CompteGrind, ClasseDiscussion,
+                    ClasseDiscussionMembre, ClasseDiscussionMessage, ClasseDiscussionMention, NotificationGrind)
+from discussion_service import assurer_discussion
 from ws_manager import manager
 
 router = APIRouter()
@@ -176,6 +178,7 @@ async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
     db.refresh(classe)
 
     db.add(ClasseMembre(classe_id=classe.id, username=username, role="prof"))
+    assurer_discussion(db, classe)
     db.commit()
 
     return {
@@ -209,8 +212,10 @@ async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db))
         raise HTTPException(status_code=400, detail="Cette classe a déjà atteint sa limite de 10 élèves")
 
     db.add(ClasseMembre(classe_id=classe.id, username=username, role="membre"))
+    discussion = assurer_discussion(db, classe)
     db.commit()
 
+    await manager.diffuser_discussion(discussion.id, {"type": "member_joined", "username": username, "nom": username})
     await manager.notifier_nouveau_membre_classe(classe.id, classe.nom, classe.createur_username, username)
 
     return {"success": True, "classe_id": classe.id, "nom": classe.nom}
@@ -220,13 +225,19 @@ async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db))
 async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
     username = _identite(session_token, db)
 
-    memberships = db.query(ClasseMembre).filter(ClasseMembre.username == username).all()
     resultat = []
+    deja = set()
+    memberships = db.query(ClasseMembre).filter(ClasseMembre.username == username).all()
     for m in memberships:
         classe = db.get(Classe, m.classe_id)
         if classe is None:
             continue
+        discussion = assurer_discussion(db, classe)
         nb_membres = db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count()
+        nb_discussion = db.query(ClasseDiscussionMembre).filter_by(discussion_id=discussion.id, actif=1).count()
+        adhesion_discussion = db.query(ClasseDiscussionMembre).filter_by(
+            discussion_id=discussion.id, username=username, actif=1
+        ).first()
         resultat.append({
             "classe_id": classe.id,
             "nom": classe.nom,
@@ -238,8 +249,47 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
             "niveau": classe.niveau,
             "matiere": classe.matiere,
             "complement": classe.complement,
+            "est_membre_classe": True,
+            "est_membre_discussion": adhesion_discussion is not None,
+            "discussion_id": discussion.id,
+            "discussion_membres": nb_discussion,
+            "discussion_invitation": discussion.code_invitation,
         })
+        deja.add(classe.id)
 
+    # Un membre du groupe peut participer à la discussion sans occuper l'un des
+    # 10 sièges de la classe scolaire. La carte reste visible avec une action
+    # distincte « rejoindre la vraie classe ».
+    discussions = db.query(ClasseDiscussionMembre).filter_by(username=username, actif=1).all()
+    for dm in discussions:
+        discussion = db.get(ClasseDiscussion, dm.discussion_id)
+        if discussion is None or discussion.classe_id in deja:
+            continue
+        classe = db.get(Classe, discussion.classe_id)
+        if classe is None:
+            continue
+        nb_membres = db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count()
+        nb_discussion = db.query(ClasseDiscussionMembre).filter_by(discussion_id=discussion.id, actif=1).count()
+        resultat.append({
+            "classe_id": classe.id,
+            "nom": classe.nom,
+            "role": dm.role,
+            "code_invitation": classe.code_invitation,
+            "nb_membres": nb_membres,
+            "prof_actuel": classe.createur_username,
+            "suspendue": sanction_active(db, classe.createur_username) is not None,
+            "niveau": classe.niveau,
+            "matiere": classe.matiere,
+            "complement": classe.complement,
+            "est_membre_classe": False,
+            "est_membre_discussion": True,
+            "discussion_id": discussion.id,
+            "discussion_membres": nb_discussion,
+            "discussion_invitation": discussion.code_invitation,
+        })
+        deja.add(classe.id)
+
+    db.commit()  # persiste la création lazy des groupes pour les classes historiques
     return {"classes": resultat}
 
 
@@ -271,7 +321,12 @@ async def renommer_classe(classe_id: int, data: ClasseRenommer, db: Session = De
     classe.nom = nouveau_nom
     if classe.niveau and classe.matiere:
         classe.complement = complement
+    discussion = db.query(ClasseDiscussion).filter_by(classe_id=classe.id).first()
+    if discussion:
+        discussion.nom = nouveau_nom
     db.commit()
+    if discussion:
+        await manager.diffuser_discussion(discussion.id, {"type": "group_name_update", "nom": nouveau_nom})
 
     return {"success": True, "nom": classe.nom}
 
@@ -318,6 +373,16 @@ async def supprimer_classe(classe_id: int, session_token: str, db: Session = Dep
     if classe.createur_username != username:
         raise HTTPException(status_code=403, detail="Seul le créateur peut supprimer cette classe")
 
+    discussion = db.query(ClasseDiscussion).filter_by(classe_id=classe_id).first()
+    if discussion:
+        await manager.fermer_discussion(discussion.id)
+        db.query(NotificationGrind).filter_by(classe_id=classe_id, resource_type="classe_discussion_message").delete(synchronize_session=False)
+        message_ids = [row[0] for row in db.query(ClasseDiscussionMessage.id).filter_by(discussion_id=discussion.id).all()]
+        if message_ids:
+            db.query(ClasseDiscussionMention).filter(ClasseDiscussionMention.message_id.in_(message_ids)).delete(synchronize_session=False)
+        db.query(ClasseDiscussionMessage).filter_by(discussion_id=discussion.id).delete(synchronize_session=False)
+        db.query(ClasseDiscussionMembre).filter_by(discussion_id=discussion.id).delete(synchronize_session=False)
+        db.delete(discussion)
     db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe_id).delete()
     db.delete(classe)
     db.commit()

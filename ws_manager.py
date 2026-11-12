@@ -19,6 +19,7 @@ class ConnectionManager:
     def __init__(self):
         self.notif_connections: dict[str, WebSocket] = {}
         self.session_connections: dict[int, dict[str, WebSocket]] = {}
+        self.discussion_connections: dict[int, dict[str, set[WebSocket]]] = {}
 
     # ---------- Notifications globales ----------
     async def connect_notif(self, username: str, ws: WebSocket):
@@ -112,6 +113,49 @@ class ConnectionManager:
         for username, ws in participants.items():
             if username != username_parti:
                 await ws.send_json({"type": "peer-parti", "sender": username_parti})
+
+    # ---------- Discussions privées liées aux classes ----------
+    async def connect_discussion(self, discussion_id: int, username: str, ws: WebSocket):
+        await ws.accept()
+        self.discussion_connections.setdefault(discussion_id, {}).setdefault(username, set()).add(ws)
+
+    def disconnect_discussion(self, discussion_id: int, username: str, ws: WebSocket):
+        groupes = self.discussion_connections.get(discussion_id, {})
+        connexions = groupes.get(username)
+        if connexions is not None:
+            connexions.discard(ws)
+            if not connexions:
+                groupes.pop(username, None)
+        if not groupes:
+            self.discussion_connections.pop(discussion_id, None)
+
+    async def diffuser_discussion(self, discussion_id: int, payload: dict, exclure: str | None = None):
+        groupes = self.discussion_connections.get(discussion_id, {})
+        for username, connexions in list(groupes.items()):
+            if username == exclure:
+                continue
+            for ws in list(connexions):
+                try:
+                    await ws.send_json(payload)
+                except Exception:
+                    self.disconnect_discussion(discussion_id, username, ws)
+
+    async def retirer_connexions_discussion(self, discussion_id: int, username: str):
+        """Révoque immédiatement toutes les sockets d'un membre retiré du groupe."""
+        groupes = self.discussion_connections.get(discussion_id, {})
+        connexions = list(groupes.get(username, set()))
+        for ws in connexions:
+            try:
+                await ws.close(code=1008, reason="Accès à la discussion révoqué")
+            except Exception:
+                pass
+            self.disconnect_discussion(discussion_id, username, ws)
+
+    async def fermer_discussion(self, discussion_id: int):
+        """Ferme les connexions d'un groupe supprimé."""
+        groupes = self.discussion_connections.get(discussion_id, {})
+        for username in list(groupes):
+            await self.retirer_connexions_discussion(discussion_id, username)
 
 
 manager = ConnectionManager()

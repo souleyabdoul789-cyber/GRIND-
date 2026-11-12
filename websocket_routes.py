@@ -18,6 +18,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from database import SessionLocal
 from auth_grind import verifier_session
 from ws_manager import manager
+from models import ClasseDiscussionMembre
 
 router = APIRouter()
 
@@ -82,3 +83,47 @@ async def ws_session(websocket: WebSocket, demande_id: int, session_token: str =
     except WebSocketDisconnect:
         manager.disconnect_session(demande_id, username)
         await manager.notifier_depart(demande_id, username)
+
+
+@router.websocket("/ws/discussion/{discussion_id}")
+async def ws_discussion(websocket: WebSocket, discussion_id: int, session_token: str = Query(...)):
+    """Canal temps réel indépendant de LiveKit pour la messagerie des classes."""
+    db = SessionLocal()
+    try:
+        username = verifier_session(session_token, db)
+        membre = db.query(ClasseDiscussionMembre).filter_by(
+            discussion_id=discussion_id, username=username, actif=1
+        ).first() if username else None
+        restreint = bool(membre and membre.restreint)
+        jusqua = membre.restriction_jusqua if membre else None
+        if restreint and jusqua is not None:
+            from datetime import datetime
+            fin = jusqua.replace(tzinfo=None) if jusqua.tzinfo else jusqua
+            if fin <= datetime.utcnow():
+                membre.restreint = 0
+                membre.restriction_jusqua = None
+                db.commit()
+                restreint = False
+    finally:
+        db.close()
+
+    if not username or not membre:
+        await websocket.close(code=1008)
+        return
+
+    await manager.connect_discussion(discussion_id, username, websocket)
+    try:
+        while True:
+            message = await websocket.receive_json()
+            type_ = message.get("type")
+            if type_ == "typing":
+                await manager.diffuser_discussion(discussion_id, {
+                    "type": "typing", "username": username,
+                    "typing": bool(message.get("typing")),
+                }, exclure=username)
+            elif type_ == "ping":
+                await websocket.send_json({"type": "pong"})
+            else:
+                await websocket.send_json({"type": "error", "message": "Événement non pris en charge."})
+    except WebSocketDisconnect:
+        manager.disconnect_discussion(discussion_id, username, websocket)
