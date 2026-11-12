@@ -241,13 +241,20 @@ def _serialiser_annonce(a: Annonce, db: Session) -> dict:
         "created_at": _iso(a.created_at),
         "auteur": _nom_affichable(auteur) if auteur else NOM_ADMIN_PAR_DEFAUT,
         "role": ROLE_ADMIN,
+        "media_url": a.media_url,
+        "media_type": a.media_type,
+        "document_url": a.document_url,
+        "document_name": a.document_name,
+        "document_type": a.document_type,
+        "important": bool(a.important),
+        "epinglee": bool(a.epinglee),
     }
 
 
 @router.post("/api/annonces")
 async def lister_annonces(data: SessionRequest, db: Session = Depends(get_db)):
     _identite(data.session_token, db)
-    annonces = db.query(Annonce).order_by(Annonce.created_at.desc()).limit(20).all()
+    annonces = db.query(Annonce).order_by(Annonce.important.desc(), Annonce.epinglee.desc(), Annonce.created_at.desc()).limit(30).all()
     return {"annonces": [_serialiser_annonce(a, db) for a in annonces]}
 
 
@@ -590,21 +597,50 @@ async def certifier(data: AdminCertifier, db: Session = Depends(get_db)):
 
 @router.post("/api/admin/annonces/publier")
 async def publier_annonce(data: AdminAnnoncePublier, db: Session = Depends(get_db)):
-    username, _ = _acteur(data.session_token, db, "annonces")
-    titre = data.titre.strip()
-    contenu = data.contenu.strip()
+    username, role = _acteur(data.session_token, db, "annonces")
+    if role != ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="Seul l'administrateur officiel peut publier une annonce GRIND.")
+    titre = (data.titre or "").strip()
+    contenu = (data.contenu or "").strip()
     if not (3 <= len(titre) <= 120):
         raise HTTPException(status_code=400, detail="Le titre doit faire entre 3 et 120 caractères")
-    if not (3 <= len(contenu) <= 3000):
-        raise HTTPException(status_code=400, detail="Le texte doit faire entre 3 et 3000 caractères")
-
-    annonce = Annonce(auteur_username=username, titre=titre, contenu=contenu)
-    db.add(annonce)
-    db.commit()
-    db.refresh(annonce)
-
+    if len(contenu) > 3000:
+        raise HTTPException(status_code=400, detail="Le texte ne peut pas dépasser 3 000 caractères")
+    if not contenu and not data.media_url and not data.document_url:
+        raise HTTPException(status_code=400, detail="Ajoute un texte, une photo, une vidéo ou un document.")
+    if data.media_type not in (None, "image", "video"):
+        raise HTTPException(status_code=400, detail="Type de média non pris en charge.")
+    media_url = (data.media_url or "").strip() or None
+    document_url = (data.document_url or "").strip() or None
+    if media_url and (not media_url.startswith("https://res.cloudinary.com/") or "/grind_posts/" not in media_url or data.media_type not in ("image", "video")):
+        raise HTTPException(status_code=400, detail="Le média doit provenir du stockage GRIND sécurisé et posséder un type valide.")
+    if not media_url and data.media_type:
+        raise HTTPException(status_code=400, detail="Un type de média est fourni sans fichier associé.")
+    document_name = (data.document_name or "").strip() or None
+    document_type = (data.document_type or "").strip() or None
+    if document_url:
+        if not document_url.startswith("https://res.cloudinary.com/") or "/grind_documents/" not in document_url:
+            raise HTTPException(status_code=400, detail="Le document doit provenir de l'espace de stockage GRIND.")
+        if document_type not in ("application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+            raise HTTPException(status_code=400, detail="Seuls les documents PDF et DOCX sont acceptés.")
+        if not document_name or len(document_name) > 180:
+            raise HTTPException(status_code=400, detail="Nom de document invalide.")
+        extension = document_name.lower().rsplit(".", 1)[-1] if "." in document_name else ""
+        extension_attendue = "pdf" if document_type == "application/pdf" else "docx"
+        if extension != extension_attendue:
+            raise HTTPException(status_code=400, detail="L'extension du document ne correspond pas à son type.")
+    elif document_name or document_type:
+        raise HTTPException(status_code=400, detail="Les métadonnées de document exigent un fichier associé.")
+    annonce = Annonce(
+        auteur_username=username, titre=titre, contenu=contenu,
+        media_url=media_url, media_type=data.media_type,
+        document_url=document_url, document_name=document_name,
+        document_type=document_type, important=1 if data.important else 0,
+        epinglee=1 if data.epinglee else 0,
+    )
+    db.add(annonce); db.commit(); db.refresh(annonce)
     payload = _serialiser_annonce(annonce, db)
-    await manager.notifier_annonce(payload, exclure=username)  # notification à tous les connectés
+    await manager.notifier_annonce(payload, exclure=username)
     return {"success": True, "annonce": payload}
 
 

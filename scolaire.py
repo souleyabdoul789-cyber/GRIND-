@@ -407,3 +407,64 @@ def catalogue() -> dict:
         "filieres": FILIERES,
         "matieres_par_niveau": matieres_par_niveau,
     }
+
+
+# ------------------------------------------------------------------ profil international (classes et matières libres)
+
+def valider_texte_scolaire(texte: str | None, *, min_len: int, max_len: int, nom: str, facultatif: bool = False) -> str | None:
+    """Valide un libellé scolaire libre sans imposer le catalogue d'un pays.
+
+    Les systèmes scolaires, séries, diplômes et parcours professionnels varient fortement.
+    On contrôle la longueur et les caractères de contrôle, sans heuristique linguistique
+    qui pourrait rejeter une appellation locale ou technique légitime.
+    """
+    propre = " ".join((texte or "").split())
+    if not propre:
+        if facultatif:
+            return None
+        raise ErreurValidation(f"{nom} est obligatoire.")
+    if len(propre) < min_len:
+        raise ErreurValidation(f"{nom} doit contenir au moins {min_len} caractères.")
+    if len(propre) > max_len:
+        raise ErreurValidation(f"{nom} ne doit pas dépasser {max_len} caractères.")
+    if not any(c.isalpha() or c.isdigit() for c in propre):
+        raise ErreurValidation(f"{nom} doit contenir des lettres ou des chiffres.")
+    if any(unicodedata.category(c) in {"Cc", "Cf", "Cs"} for c in propre):
+        raise ErreurValidation(f"{nom} contient un caractère non autorisé.")
+    return propre
+
+
+def valider_difficultes_libres(brut) -> list[str]:
+    """Accepte une liste de matières librement saisies, sans catalogue fermé."""
+    if brut is None:
+        raise ErreurValidation("Indique au moins une matière à travailler.")
+    if isinstance(brut, str):
+        texte = brut.strip()
+        if texte.startswith("["):
+            import json
+            try:
+                elements = json.loads(texte)
+            except ValueError:
+                raise ErreurValidation("La liste des matières est illisible.")
+        else:
+            elements = re.split(r"[,;\n]", texte)
+    else:
+        try:
+            elements = list(brut)
+        except TypeError:
+            raise ErreurValidation("Indique une liste de matières valide.")
+    resultat = []
+    cles = set()
+    for element in elements:
+        if element is None:
+            continue
+        valeur = valider_texte_scolaire(str(element), min_len=2, max_len=80, nom="Une matière")
+        cle_matiere = sans_accents(valeur).casefold()
+        if cle_matiere not in cles:
+            cles.add(cle_matiere)
+            resultat.append(valeur)
+    if not resultat:
+        raise ErreurValidation("Indique au moins une matière à travailler.")
+    if len(resultat) > 8:
+        raise ErreurValidation("8 matières au maximum.")
+    return resultat

@@ -109,7 +109,7 @@ def reinit_autorisee(flux, maintenant_: datetime) -> bool:
     valide = avec_fuseau(flux.code_valide_le)
     return (
         not flux.fantome
-        and flux.objet == "reinitialisation"
+        and flux.objet in {"reinitialisation", "pin_reinitialisation"}
         and valide is not None
         and (maintenant_ - valide) <= timedelta(minutes=FENETRE_REINIT_MIN)
         and flux_utilisable(flux, maintenant_)

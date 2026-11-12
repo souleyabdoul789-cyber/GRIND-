@@ -1,11 +1,9 @@
 """
-auth_grind.py — identité PROPRE à GRIND.
+auth_grind.py — identité propre à GRIND.
 
-Distinct de pluton_client.py : ici on gère le compte et les sessions
-internes à GRIND (username/password choisis dans GRIND, pas ceux de
-G-SOCIETY). La clé G-SOCIETY (pluton_client.verifier_cle) n'intervient
-qu'une seule fois, à l'inscription, comme preuve que le compte
-correspond bien à un utilisateur G-SOCIETY légitime.
+Les comptes, mots de passe et sessions sont gérés localement par GRIND.
+Aucun appel à G-SOCIETY/Pluton n'est nécessaire pour se connecter ou
+maintenir une session.
 """
 
 import bcrypt
@@ -14,7 +12,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
-from models import GrindSession
+from models import GrindSession, CompteGrind
 from moderation import sanction_active
 
 DUREE_SESSION_JOURS = 30
@@ -54,10 +52,9 @@ def supprimer_session(token: str, db: Session) -> None:
     db.commit()
 
 
-def verifier_session(token: str, db: Session) -> str | None:
+def verifier_session(token: str, db: Session, autoriser_proviseur: bool = False, ignorer_pin: bool = False) -> str | None:
     """Renvoie le username GRIND propriétaire de ce token, ou None si
-    invalide/expiré. Vérification locale, pas d'appel réseau à Pluton —
-    c'est justement le but : Pluton n'est sollicité qu'à l'inscription."""
+    invalide/expiré. La vérification est locale et ne dépend d'aucun service externe."""
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     session = db.query(GrindSession).filter(
         GrindSession.token_hash == token_hash,
@@ -65,8 +62,28 @@ def verifier_session(token: str, db: Session) -> str | None:
     ).first()
     if session is None:
         return None
+    compte = db.get(CompteGrind, session.username)
+    if compte is None:
+        return None
+    # Un PIN configuré est exigé à la connexion et au moins toutes les 48 h.
+    # Les seules routes qui ignorent cette barrière sont les routes PIN elles-mêmes.
+    if compte.pin_hash and not ignorer_pin:
+        pin_valide_le = session.pin_verifie_le
+        if pin_valide_le is None:
+            return None
+        pin_valide_le = pin_valide_le if pin_valide_le.tzinfo else pin_valide_le.replace(tzinfo=timezone.utc)
+        if pin_valide_le + timedelta(hours=48) <= datetime.now(timezone.utc):
+            return None
     # Un compte suspendu ou banni n'a plus accès à rien : sa session ne vaut plus rien.
     # (Le message précis lui est donné quand il essaie de se reconnecter.)
     if sanction_active(db, session.username) is not None:
         return None
+    # Un compte candidat/proviseur reste isolé de l'API élève tant que le
+    # parcours institutionnel (publication cloisonnée et permissions) n'est pas appelé.
+    # Seules les routes dédiées proviseur passent explicitement autoriser_proviseur=True.
+    if not autoriser_proviseur:
+        from models_proviseur import ProviseurCandidature
+        candidature = db.query(ProviseurCandidature).filter_by(username=session.username).first()
+        if candidature is not None:
+            return None
     return session.username

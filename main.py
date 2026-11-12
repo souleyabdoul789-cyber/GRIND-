@@ -6,7 +6,7 @@ load_dotenv()  # charge le fichier .env AVANT tout le reste — doit rester la 1
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from database import Base, engine, get_db, migrer_colonnes_manquantes
+from database import Base, engine, get_db, migrer_colonnes_manquantes, migrer_index_manquants
 from fastapi import Depends
 from sqlalchemy.orm import Session
 from auth_grind import verifier_session
@@ -21,17 +21,24 @@ from routes_avatar import router as router_avatar
 from routes_livekit import router as router_livekit
 from routes_moderation import router as router_moderation
 from routes_support import router as router_support
+from routes_proviseur import router as router_proviseur
+from routes_security import router as router_security
 
 METERED_TURN_USERNAME = os.getenv("METERED_TURN_USERNAME")
 METERED_TURN_CREDENTIAL = os.getenv("METERED_TURN_CREDENTIAL")
 
 app = FastAPI(title="GRIND")
 
+_origines_frontend = [
+    origine.strip().rstrip("/")
+    for origine in os.getenv("GRIND_FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    if origine.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # à restreindre au domaine du frontend GRIND une fois connu
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_origines_frontend,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 app.include_router(router_compte)
@@ -44,12 +51,15 @@ app.include_router(router_avatar)
 app.include_router(router_livekit)
 app.include_router(router_moderation)
 app.include_router(router_support)
+app.include_router(router_proviseur)
+app.include_router(router_security)
 
 
 @app.on_event("startup")
 def creer_tables():
     Base.metadata.create_all(bind=engine)
     migrer_colonnes_manquantes(Base)
+    migrer_index_manquants(Base)
 
 
 @app.get("/")

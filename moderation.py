@@ -86,7 +86,9 @@ def badge_de(db, username: str) -> dict:
     if compte is None:
         return {"role": None, "certifie": False}
     role = compte.role if compte.role in TOUS_LES_ROLES else None
-    return {"role": role, "certifie": bool(compte.certifie)}
+    from models_proviseur import ProviseurCandidature
+    proviseur = db.query(ProviseurCandidature).filter_by(username=username, statut="approuve").first() is not None
+    return {"role": role, "certifie": bool(compte.certifie), "proviseur": proviseur}
 
 
 # ------------------------------------------------------------------ sanctions

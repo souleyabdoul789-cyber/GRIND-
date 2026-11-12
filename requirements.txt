@@ -7,3 +7,7 @@ pymysql
 python-dotenv
 bcrypt
 PyJWT
+cryptography
+python-multipart
+
+google-auth>=2.29,<3

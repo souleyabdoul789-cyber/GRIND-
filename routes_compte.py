@@ -3,7 +3,7 @@ routes_compte.py — comptes GRIND : inscription, vérification d'e-mail, connex
 
 Principes (tous appliqués ICI, côté serveur) :
   - une adresse e-mail obligatoire et UNIQUE par compte ; aucune session n'existe tant qu'elle n'est pas vérifiée ;
-  - code à 7 chiffres envoyé par G-SOCIETY (voir verification.py et mailer.py) ;
+  - code à 7 chiffres envoyé à l'adresse de l'utilisateur (voir verification.py et mailer.py) ;
   - aucune réponse ne permet de savoir si une adresse e-mail a un compte (flux fantômes, messages identiques) ;
   - freins contre la force brute : par adresse IP, par compte, par code (3 essais) ;
   - les adresses e-mail ne s'affichent JAMAIS en entier dans une confirmation (ex****l@gmail.com) ;
@@ -23,16 +23,16 @@ import verification as vf
 from auth_grind import creer_session, hacher_mot_de_passe, supprimer_session, verifier_mot_de_passe
 from database import get_db
 from limiteur import autoriser, noter_echec, oublier, trop_d_echecs
-from models import CompteGrind, GrindSession, VerificationEmail
+from models import CompteGrind, GrindSession, VerificationEmail, GrindDeviceAccount
+from models_proviseur import ProviseurCandidature
 from moderation import (
     ADMIN_USERNAME, CGU_VERSION, ROLE_ADMIN,
     cle_admin_valide, detail_sanction, nom_reserve, sanction_active,
 )
-from pluton_client import verifier_cle
 from scolaire import ErreurValidation, catalogue
 from schemas import (
     AssocierEmail, CompteGrindLogin, CompteGrindSignup, JetonVerification, MotDePasseOublie,
-    ReinitialiserMotDePasse, SessionRequest, VerifierCode,
+    ReinitialiserMotDePasse, SessionRequest, VerifierCode, GoogleAuthRequest,
 )
 from validation import (
     email_canonique, masquer_email, valider_email, valider_mot_de_passe, valider_pseudo,
@@ -75,13 +75,16 @@ async def _envoyer_gabarit(email: str, gabarit):
     await mailer.envoyer(email, sujet, texte, html)
 
 
-def _payload_session(compte: CompteGrind, token: str) -> dict:
+def _payload_session(compte: CompteGrind, token: str, db: Session) -> dict:
+    candidature = db.query(ProviseurCandidature).filter_by(username=compte.username).first()
     return {
         "success": True,
         "session_token": token,
         "username": compte.username,
         "role": compte.role,
         "nom_affiche": compte.nom_affiche,
+        "type_compte": "proviseur" if candidature else "eleve",
+        "proviseur_statut": candidature.statut if candidature else None,
     }
 
 
@@ -135,10 +138,6 @@ async def signup(data: CompteGrindSignup, request: Request, taches: BackgroundTa
     if not data.cgu_acceptees:
         _erreur(400, "cgu", "Tu dois accepter les conditions d'utilisation pour créer un compte.")
 
-    valide, gsociety_username = await verifier_cle(data.api_key)
-    if not valide:
-        _erreur(401, "cle_invalide", "Clé API G-SOCIETY invalide ou expirée. Génère-en une sur le site G-SOCIETY (catégorie grind).")
-
     _purger_inscriptions_non_verifiees(db)
 
     if db.query(CompteGrind).filter(func.lower(CompteGrind.username) == pseudo.lower()).first() is not None:
@@ -161,7 +160,9 @@ async def signup(data: CompteGrindSignup, request: Request, taches: BackgroundTa
     compte = CompteGrind(
         username=pseudo,
         password_hash=hacher_mot_de_passe(data.password),
-        gsociety_username=gsociety_username,
+        # Valeur sentinelle compatible avec les bases existantes (colonne historique NOT NULL).
+        # Aucune vérification ni dépendance à G-SOCIETY n'est utilisée pour les nouvelles inscriptions.
+        gsociety_username="__GRIND_NATIVE__",
         cgu_version=CGU_VERSION,
         cgu_acceptees_le=datetime.now(timezone.utc),
         email=email,
@@ -213,7 +214,7 @@ async def verifier_le_code(data: VerifierCode, request: Request, db: Session = D
         flux.utilise_le = now
         db.commit()
         oublier(f"verif:{ip}")
-        return _payload_session(compte, creer_session(compte.username, db))
+        return _payload_session(compte, creer_session(compte.username, db), db)
 
     # Réinitialisation : le code est validé, il reste à choisir le nouveau mot de passe.
     flux.code_valide_le = now
@@ -293,9 +294,20 @@ async def login(data: CompteGrindLogin, request: Request, taches: BackgroundTask
     if cle_admin_valide(data.password):
         compte = _compte_admin(db)
         oublier(ip)
-        return _payload_session(compte, creer_session(compte.username, db))
+        return _payload_session(compte, creer_session(compte.username, db), db)
 
-    compte = db.get(CompteGrind, (data.username or "").strip())
+    identifiant = (data.username or "").strip()
+    if "@" in identifiant:
+        try:
+            canon = email_canonique(valider_email(identifiant))
+            compte = db.query(CompteGrind).filter(
+                (CompteGrind.email_canonique == canon)
+                | (func.lower(CompteGrind.email) == identifiant.lower())
+            ).first()
+        except ErreurValidation:
+            compte = None
+    else:
+        compte = db.get(CompteGrind, identifiant)
     mot_de_passe_ok = verifier_mot_de_passe(data.password, compte.password_hash if compte else _HASH_FACTICE)
     if compte is None or compte.username == ADMIN_USERNAME or not mot_de_passe_ok:
         noter_echec(ip)
@@ -309,16 +321,108 @@ async def login(data: CompteGrindLogin, request: Request, taches: BackgroundTask
 
     # Tant que l'envoi d'e-mails n'est pas configuré, personne n'est enfermé dehors : la vérification
     # devient obligatoire dès que le relais e-mail fonctionne (voir docs/CONFIGURATION-EMAIL.md).
-    if compte.email_verifie != 1 and mailer.configuration_ok():
+    candidature_prov = db.query(ProviseurCandidature).filter_by(username=compte.username).first()
+    # Les comptes proviseur utilisent un numéro de contact manuel, jamais un OTP téléphonique
+    # ni une adresse e-mail obligatoire. Leur activation dépend de la décision admin.
+    if candidature_prov is None and compte.email_verifie != 1 and mailer.configuration_ok():
         await _exiger_verification(db, compte, ip, taches)
 
     oublier(ip)
     oublier(cle_compte)
-    return _payload_session(compte, creer_session(compte.username, db))
+    return _payload_session(compte, creer_session(compte.username, db), db)
+
+
+@router.post("/api/compte/google")
+async def connexion_google(data: GoogleAuthRequest, db: Session = Depends(get_db)):
+    """Connexion/inscription Google : le jeton ID est vérifié côté serveur."""
+    import os
+    from datetime import datetime, timezone
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    if not client_id:
+        _erreur(503, "google_indisponible", "La connexion Google n'est pas encore configurée côté serveur.")
+    try:
+        from google.oauth2 import id_token
+        from google.auth.transport import requests as google_requests
+    except ImportError:
+        _erreur(503, "google_dependance_absente", "La vérification Google est indisponible côté serveur. Installe les dépendances déclarées dans requirements.txt.")
+    try:
+        claims = id_token.verify_oauth2_token(data.credential, google_requests.Request(), audience=client_id)
+    except Exception:
+        _erreur(401, "google_jeton_invalide", "La validation de ton compte Google a échoué. Recommence.")
+    issuer = claims.get("iss")
+    if issuer not in {"accounts.google.com", "https://accounts.google.com"} or claims.get("email_verified") is not True:
+        _erreur(401, "google_identite_non_verifiee", "Google n'a pas confirmé cette adresse e-mail.")
+    email = claims.get("email", "").strip()
+    sub = claims.get("sub", "").strip()
+    try:
+        email = valider_email(email)
+        canon = email_canonique(email)
+    except ErreurValidation:
+        _erreur(400, "google_email_invalide", "Google n'a pas fourni une adresse e-mail utilisable.")
+    if not sub:
+        _erreur(401, "google_identite_invalide", "Identité Google incomplète.")
+
+    compte = db.query(CompteGrind).filter(CompteGrind.google_sub == sub).first()
+    if compte is None:
+        compte = db.query(CompteGrind).filter(
+            (CompteGrind.email_canonique == canon) | (func.lower(CompteGrind.email) == email.lower())
+        ).first()
+        if compte is not None:
+            candidature = db.query(ProviseurCandidature).filter_by(username=compte.username).first()
+            if candidature:
+                _erreur(403, "google_compte_direction", "Ce compte de direction utilise sa connexion par nom de profil et mot de passe.")
+            if compte.google_sub and compte.google_sub != sub:
+                _erreur(409, "google_deja_lie", "Cette adresse est déjà liée à une autre identité Google.")
+            compte.google_sub = sub
+            compte.email = email
+            compte.email_canonique = canon
+            compte.email_verifie = 1
+            compte.email_verifie_le = datetime.now(timezone.utc)
+        else:
+            username = (data.username or "").strip()
+            if not username:
+                return {"username_requis": True}
+            try:
+                pseudo = valider_pseudo(username)
+            except ErreurValidation as erreur:
+                _erreur(400, "validation", str(erreur))
+            if nom_reserve(pseudo):
+                _erreur(400, "pseudo_reserve", "Ce nom d'utilisateur est réservé.")
+            if not data.cgu_acceptees:
+                _erreur(400, "cgu", "Tu dois accepter les conditions d'utilisation avant de créer ton compte.")
+            if db.query(CompteGrind).filter(func.lower(CompteGrind.username) == pseudo.lower()).first():
+                _erreur(409, "pseudo_pris", "Ce nom d'utilisateur est déjà utilisé.")
+            mot_de_passe_aleatoire = secrets.token_urlsafe(48)
+            compte = CompteGrind(
+                username=pseudo,
+                password_hash=hacher_mot_de_passe(mot_de_passe_aleatoire),
+                gsociety_username="__GRIND_NATIVE__",
+                cgu_version=CGU_VERSION,
+                cgu_acceptees_le=datetime.now(timezone.utc),
+                email=email,
+                email_canonique=canon,
+                email_verifie=1,
+                email_verifie_le=datetime.now(timezone.utc),
+                google_sub=sub,
+            )
+            db.add(compte)
+    elif compte.email_canonique != canon:
+        _erreur(409, "google_email_modifie", "L'adresse du compte Google ne correspond plus à celle liée au compte GRIND.")
+
+    db.commit()
+    if compte.username == ADMIN_USERNAME:
+        _erreur(403, "google_admin_interdit", "L'administration utilise son mécanisme de connexion dédié.")
+    sanction = sanction_active(db, compte.username)
+    if sanction is not None:
+        raise HTTPException(status_code=403, detail=detail_sanction(db, sanction, emettre_jeton=True))
+    return _payload_session(compte, creer_session(compte.username, db), db)
 
 
 @router.post("/api/compte/deconnexion")
 async def deconnexion(data: SessionRequest, db: Session = Depends(get_db)):
+    import hashlib
+    token_hash = hashlib.sha256(data.session_token.encode()).hexdigest()
+    db.query(GrindDeviceAccount).filter(GrindDeviceAccount.token_hash == token_hash).delete()
     supprimer_session(data.session_token, db)
     return {"success": True}
 

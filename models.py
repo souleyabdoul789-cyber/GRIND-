@@ -1,9 +1,9 @@
 """
 models.py — schéma de la base GRIND.
 
-Rien ici ne concerne l'identité G-SOCIETY (compte, mot de passe) : ça
-reste géré par Pluton. Ici on stocke uniquement ce qui est propre à
-GRIND — le username G-SOCIETY sert juste de clé étrangère textuelle.
+Les comptes, mots de passe et sessions sont gérés nativement par GRIND.
+Les colonnes historiques liées à G-SOCIETY restent conservées pour ne pas
+casser les comptes créés avant la migration.
 """
 
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, UniqueConstraint
@@ -12,14 +12,13 @@ from database import Base
 
 
 class CompteGrind(Base):
-    """Compte propre à GRIND — distinct du compte G-SOCIETY. La clé API
-    G-SOCIETY (catégorie "grind") n'est vérifiée qu'UNE FOIS, à
-    l'inscription, comme preuve de sécurité — pas à chaque requête."""
+    """Compte autonome GRIND. Les valeurs historiques de gsociety_username
+    sont conservées ; les nouveaux comptes utilisent le marqueur GRIND natif."""
     __tablename__ = "comptes_grind"
 
     username = Column(String(64), primary_key=True)
     password_hash = Column(String(128), nullable=False)
-    gsociety_username = Column(String(64), nullable=False)  # traçabilité : quel compte G-SOCIETY a validé l'inscription
+    gsociety_username = Column(String(64), nullable=False)  # historique conservé ; "__GRIND_NATIVE__" pour les nouveaux comptes
     cgu_version = Column(String(16), nullable=True)  # version des CGU acceptée
     cgu_acceptees_le = Column(DateTime(timezone=True), nullable=True)
     role = Column(String(16), nullable=True)  # None = élève ; "admin" / "associe" / "controleur"
@@ -31,6 +30,11 @@ class CompteGrind(Base):
     email_canonique = Column(String(254), nullable=True, index=True)  # sert à l'unicité (gmail : points/+ ignorés)
     email_verifie = Column(Integer, nullable=True)
     email_verifie_le = Column(DateTime(timezone=True), nullable=True)
+    google_sub = Column(String(128), nullable=True, unique=True, index=True)
+    pin_hash = Column(String(128), nullable=True)
+    pin_echecs = Column(Integer, nullable=True, default=0)
+    pin_bloque_jusqua = Column(DateTime(timezone=True), nullable=True)
+    premium_until = Column(DateTime(timezone=True), nullable=True)  # entitlement premium vérifié côté serveur
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -44,6 +48,20 @@ class GrindSession(Base):
     username = Column(String(64), ForeignKey("comptes_grind.username"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False)
+    pin_verifie_le = Column(DateTime(timezone=True), nullable=True)
+
+
+class GrindDeviceAccount(Base):
+    """Association d'un compte à un navigateur/appareil, sans stocker de jeton en clair."""
+    __tablename__ = "grind_device_accounts"
+    __table_args__ = (UniqueConstraint("device_hash", "username", name="uq_grind_device_username"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    device_hash = Column(String(64), nullable=False, index=True)
+    username = Column(String(64), ForeignKey("comptes_grind.username"), nullable=False)
+    token_hash = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_used_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class Profil(Base):
@@ -51,11 +69,13 @@ class Profil(Base):
     utilisation. Sert à l'algorithme de matching et à l'IA de structuration."""
     __tablename__ = "profils"
 
-    username = Column(String(64), primary_key=True)  # username G-SOCIETY
+    username = Column(String(64), primary_key=True)  # identifiant public GRIND
     age = Column(Integer, nullable=False)
     pays = Column(String(64), nullable=False)
-    niveau = Column(String(128), nullable=False)  # classe / filière
-    difficultes = Column(Text, nullable=True)  # texte libre ou JSON stringifié
+    niveau = Column(String(128), nullable=False)  # classe / niveau saisi librement
+    difficultes = Column(Text, nullable=True)  # matières libres, JSON stringifié
+    filiere = Column(String(100), nullable=True)  # général, professionnel, technique, etc.
+    etablissement = Column(String(160), nullable=True)  # établissement déclaré par l'élève
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -127,7 +147,12 @@ class Post(Base):
     statut = Column(String(16), default="ouverte")  # ouverte / resolue / expiree / publiee (demonstration)
     raison_expiration = Column(Text, nullable=True)
     media_url = Column(String(512), nullable=True)
-    media_type = Column(String(8), nullable=True)  # "image" ou "video"
+    media_type = Column(String(8), nullable=True)  # "image", "video" ou "document"
+    document_url = Column(String(512), nullable=True)
+    document_name = Column(String(180), nullable=True)
+    document_type = Column(String(80), nullable=True)
+    etablissement_id = Column(Integer, nullable=True, index=True)  # post institutionnel, NULL = fil général
+    auteur_type = Column(String(16), nullable=True, default="eleve")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -230,6 +255,13 @@ class Annonce(Base):
     auteur_username = Column(String(64), nullable=False)
     titre = Column(String(120), nullable=False)
     contenu = Column(Text, nullable=False)
+    media_url = Column(String(512), nullable=True)
+    media_type = Column(String(8), nullable=True)  # image / video
+    document_url = Column(String(512), nullable=True)
+    document_name = Column(String(180), nullable=True)
+    document_type = Column(String(80), nullable=True)
+    important = Column(Integer, nullable=True, default=0)
+    epinglee = Column(Integer, nullable=True, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -306,4 +338,18 @@ class VerificationEmail(Base):
     utilise_le = Column(DateTime(timezone=True), nullable=True)
     fantome = Column(Integer, default=0)  # 1 = faux flux (adresse inconnue / déjà utilisée) : ne peut jamais aboutir
     ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class NotificationGrind(Base):
+    """Notification persistante liée à une mention dans une publication ou un commentaire."""
+    __tablename__ = "notifications_grind"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    destinataire_username = Column(String(64), nullable=False, index=True)
+    acteur_username = Column(String(64), nullable=False)
+    type = Column(String(24), nullable=False)
+    post_id = Column(Integer, nullable=True)
+    commentaire_id = Column(Integer, nullable=True)
+    extrait = Column(String(240), nullable=True)
+    lu = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

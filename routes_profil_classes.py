@@ -9,10 +9,11 @@ from auth_grind import verifier_session
 from schemas import ProfilCreate, ClasseCreate, ClasseRejoindre, ClasseRenommer, ClasseTransfererProf
 from moderation import badge_de, sanction_active
 from scolaire import (
-    ErreurValidation, valider_age, valider_niveau, valider_difficultes, valider_texte_libre,
-    valider_classe, cle_doublon_classe, composer_nom_classe,
+    ErreurValidation, valider_age, valider_texte_scolaire, valider_difficultes_libres,
+    valider_texte_libre, valider_classe, cle_doublon_classe, composer_nom_classe,
 )
-from models import Profil, Classe, ClasseMembre
+from models_proviseur import ProviseurCandidature, ProviseurAutorisation, Etablissement
+from models import Profil, Classe, ClasseMembre, CompteGrind
 from ws_manager import manager
 
 router = APIRouter()
@@ -34,23 +35,63 @@ async def creer_ou_maj_profil(data: ProfilCreate, db: Session = Depends(get_db))
         profil = Profil(username=username)
         db.add(profil)
 
-    # Validation SERVEUR de toutes les données scolaires : rien d'absurde n'entre dans la base.
+    # Validation serveur souple : les appellations de classes, filières et matières
+    # varient selon les pays et les parcours général/professionnel.
     try:
         age = valider_age(data.age)
-        niveau = valider_niveau(data.niveau)
+        niveau = valider_texte_scolaire(data.niveau, min_len=2, max_len=80, nom="La classe / le niveau")
         pays = (data.pays or "").strip()
-        pays = pays.lower() if re.fullmatch(r"[A-Za-z]{2}", pays) else valider_texte_libre(pays, min_len=2, max_len=40, nom="Le pays")
-        difficultes = valider_difficultes(data.difficultes, niveau)
+        pays = pays.lower() if re.fullmatch(r"[A-Za-z]{2}", pays) else valider_texte_scolaire(pays, min_len=2, max_len=60, nom="Le pays")
+        filiere = valider_texte_scolaire(data.filiere, min_len=2, max_len=100, nom="La filière", facultatif=True)
+        etablissement = valider_texte_scolaire(data.etablissement, min_len=2, max_len=160, nom="L'établissement", facultatif=True)
+        difficultes = valider_difficultes_libres(data.difficultes)
     except ErreurValidation as erreur:
         raise HTTPException(status_code=400, detail=str(erreur))
 
     profil.age = age
     profil.pays = pays
-    profil.niveau = niveau["label"]
+    profil.niveau = niveau
+    champs_envoyes = getattr(data, "model_fields_set", None)
+    if champs_envoyes is None:  # compatibilité Pydantic 1.x
+        champs_envoyes = getattr(data, "__fields_set__", set())
+    if "filiere" in champs_envoyes:
+        profil.filiere = filiere
+    if "etablissement" in champs_envoyes:
+        profil.etablissement = etablissement
     profil.difficultes = json.dumps(difficultes, ensure_ascii=False)
     db.commit()
 
     return {"success": True, "message": "Profil enregistré"}
+
+
+
+@router.post("/api/profil/nom-utilisateur")
+async def modifier_nom_utilisateur(data: dict, db: Session = Depends(get_db)):
+    """Change l'identifiant public et propage le renommage aux références internes."""
+    username_actuel = _identite(data.get("session_token", ""), db)
+    nouveau = (data.get("nouveau_username") or "").strip()
+    if not re.fullmatch(r"[A-Za-z_]{3,24}", nouveau):
+        raise HTTPException(status_code=400, detail="Le nom doit contenir 3 à 24 lettres ou underscores, sans espace ni @.")
+    if nouveau.lower() == username_actuel.lower():
+        return {"success": True, "username": username_actuel, "changed": False}
+    from sqlalchemy import func, update
+    from database import Base
+    if db.query(CompteGrind).filter(func.lower(CompteGrind.username) == nouveau.lower()).first():
+        raise HTTPException(status_code=409, detail="Ce nom de profil est déjà utilisé.")
+    try:
+        # Mettre à jour les tables dépendantes avant la clé primaire du compte.
+        for table in Base.metadata.sorted_tables:
+            if table.name == CompteGrind.__tablename__:
+                continue
+            for colonne in table.columns:
+                if colonne.name == "username" or colonne.name.endswith("_username") or colonne.name == "traite_par":
+                    db.execute(update(table).where(colonne == username_actuel).values({colonne.name: nouveau}))
+        db.execute(update(CompteGrind.__table__).where(CompteGrind.username == username_actuel).values(username=nouveau))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Le changement de nom n'a pas pu être appliqué. Aucune modification n'a été validée.")
+    return {"success": True, "username": nouveau, "changed": True}
 
 
 @router.get("/api/profil/moi")
@@ -64,6 +105,8 @@ async def lire_mon_profil(session_token: str, db: Session = Depends(get_db)):
         "age": profil.age if profil else None,
         "pays": profil.pays if profil else None,
         "niveau": profil.niveau if profil else None,
+        "filiere": profil.filiere if profil else None,
+        "etablissement": profil.etablissement if profil else None,
         "difficultes": profil.difficultes if profil else None,
     }
 
@@ -74,14 +117,26 @@ async def lire_profil_de(username: str, db: Session = Depends(get_db)):
     le profil de son auteur. Rien de sensible dedans (mêmes infos que
     chacun affiche déjà sur son propre profil)."""
     profil = db.get(Profil, username)
+    candidature = db.query(ProviseurCandidature).filter_by(username=username, statut="approuve").first()
+    etablissements_prov = []
+    if candidature:
+        etablissements_prov = [
+            e.nom for a, e in db.query(ProviseurAutorisation, Etablissement).join(
+                Etablissement, Etablissement.id == ProviseurAutorisation.etablissement_id
+            ).filter(ProviseurAutorisation.candidature_id == candidature.id, ProviseurAutorisation.actif == 1).all()
+        ]
     return {
         "username": username,
         "badge": badge_de(db, username),
+        "proviseur": ({"badge": "Proviseur", "nom_etablissement": candidature.etablissement_declare,
+                       "logo_url": candidature.logo_url, "etablissements": etablissements_prov} if candidature else None),
         "sanctionne": sanction_active(db, username) is not None,
         "profil_existe": profil is not None,
-        "age": profil.age if profil else None,
+        # L'âge est une donnée personnelle : il n'est jamais exposé par la route publique.
         "pays": profil.pays if profil else None,
         "niveau": profil.niveau if profil else None,
+        "filiere": profil.filiere if profil else None,
+        "etablissement": profil.etablissement if profil else None,
         "difficultes": profil.difficultes if profil else None,
     }
 

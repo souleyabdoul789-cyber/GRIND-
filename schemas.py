@@ -1,17 +1,15 @@
 from pydantic import BaseModel
 from typing import Any, Optional
 
-# session_token = identité GRIND (obtenue au login GRIND), utilisée
-# partout SAUF à l'inscription, où api_key = clé G-SOCIETY catégorie
-# "grind", vérifiée une seule fois comme preuve de sécurité.
+# Les comptes GRIND sont autonomes : l'inscription ne dépend pas d'une clé G-SOCIETY.
+# La vérification par e-mail reste le contrôle d'activation des comptes ordinaires.
 
 
 class CompteGrindSignup(BaseModel):
     username: str
     email: str
     password: str
-    api_key: str  # clé G-SOCIETY catégorie "grind", générée sur le site G-SOCIETY
-    cgu_acceptees: bool = False  # case "J'accepte les CGU" cochée à l'inscription
+    cgu_acceptees: bool = False
 
 
 class CompteGrindLogin(BaseModel):
@@ -34,7 +32,9 @@ class ProfilCreate(BaseModel):
     age: int
     pays: str
     niveau: str
-    difficultes: Optional[Any] = None  # liste de matières (ou ancien format texte)
+    filiere: Optional[str] = None
+    etablissement: Optional[str] = None
+    difficultes: Optional[Any] = None  # matières libres, liste ou texte séparé par des virgules
 
 
 class ClasseCreate(BaseModel):
@@ -77,6 +77,10 @@ class PostCreate(BaseModel):
     date_limite: Optional[str] = None  # ISO 8601, requis si categorie == "probleme"
     media_url: Optional[str] = None
     media_type: Optional[str] = None  # "image" ou "video"
+    document_url: Optional[str] = None
+    document_name: Optional[str] = None
+    document_type: Optional[str] = None
+    etablissement_id: Optional[int] = None
 
 
 class CommentaireCreate(BaseModel):
@@ -160,7 +164,14 @@ class AdminCertifier(BaseModel):
 class AdminAnnoncePublier(BaseModel):
     session_token: str
     titre: str
-    contenu: str
+    contenu: str = ""
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
+    document_url: Optional[str] = None
+    document_name: Optional[str] = None
+    document_type: Optional[str] = None
+    important: bool = False
+    epinglee: bool = False
 
 
 class AdminAnnonceSupprimer(BaseModel):
@@ -282,3 +293,41 @@ class MotDePasseOublie(BaseModel):
 class ReinitialiserMotDePasse(BaseModel):
     jeton_verification: str
     mot_de_passe: str
+
+
+class GoogleAuthRequest(BaseModel):
+    credential: str
+    username: Optional[str] = None
+    cgu_acceptees: bool = False
+
+
+class PinRequest(BaseModel):
+    session_token: str
+    pin: str
+
+
+class PinResetRequest(BaseModel):
+    session_token: str
+    password: str
+    nouveau_pin: str
+
+
+class PinResetEmailStart(BaseModel):
+    session_token: str
+
+
+class PinResetEmailFinish(BaseModel):
+    session_token: str
+    jeton_verification: str
+    nouveau_pin: str
+
+
+class DeviceRememberRequest(BaseModel):
+    session_token: str
+    device_id: str
+
+
+class DeviceForgetRequest(BaseModel):
+    session_token: str
+    device_id: str
+    username: str

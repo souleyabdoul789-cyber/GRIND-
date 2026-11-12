@@ -15,26 +15,66 @@ Comme partout ailleurs : l'identité vient de la session GRIND
 """
 
 from datetime import datetime, timezone
+import re
+import unicodedata
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from database import get_db
 from auth_grind import verifier_session
 from schemas import PostCreate, CommentaireCreate, LikeToggle, ResoudrePost, ExpirerPost
-from models import Post, PostLike, PostCommentaire
+from models import Post, PostLike, PostCommentaire, Profil, CompteGrind, NotificationGrind
+from models_proviseur import ProviseurCandidature, ProviseurAutorisation, Etablissement
 from moderation import badge_de, usernames_sanctionnes, bloques_par
 
 router = APIRouter()
 
 
 def _identite(session_token: str, db: Session) -> str:
-    username = verifier_session(session_token, db)
+    username = verifier_session(session_token, db, autoriser_proviseur=True)
     if username is None:
         raise HTTPException(status_code=401, detail="Session GRIND invalide ou expirée — reconnecte-toi")
+    candidature = db.query(ProviseurCandidature).filter_by(username=username).first()
+    if candidature and candidature.statut != "approuve":
+        raise HTTPException(status_code=403, detail="Le compte établissement est en attente de validation.")
     return username
 
 
+def _creer_notifications_mentions(texte: str, acteur: str, post_id: int, db: Session, commentaire_id=None):
+    """Résout les @identifiants connus, sans notifier l'auteur lui-même."""
+    mentions = {m.lower() for m in re.findall(r"(?<![A-Za-z0-9_])@([A-Za-z_]{3,24})", texte or "")}
+    if not mentions:
+        return
+    comptes = db.query(CompteGrind).all()
+    correspondances = {c.username.lower(): c.username for c in comptes}
+    post = db.get(Post, post_id)
+    extrait = re.sub(r"\s+", " ", texte or "")[:240]
+    for cle in mentions:
+        destinataire = correspondances.get(cle)
+        if not destinataire or destinataire == acteur:
+            continue
+        # Une publication institutionnelle ne déclenche des mentions que dans son établissement.
+        if post and post.etablissement_id is not None:
+            profil_dest = db.get(Profil, destinataire)
+            etab_dest = db.get(Etablissement, post.etablissement_id)
+            if not profil_dest or not etab_dest or _canon_etablissement(profil_dest.etablissement) != etab_dest.nom_canonique:
+                continue
+        # Évite les doublons pour le même contenu et la même mention.
+        q = db.query(NotificationGrind).filter_by(destinataire_username=destinataire, acteur_username=acteur, type="mention", post_id=post_id)
+        if commentaire_id is not None:
+            q = q.filter_by(commentaire_id=commentaire_id)
+        if q.first() is None:
+            db.add(NotificationGrind(destinataire_username=destinataire, acteur_username=acteur, type="mention", post_id=post_id, commentaire_id=commentaire_id, extrait=extrait))
+
+
 CATEGORIES_VALIDES = ("demonstration", "probleme")
+
+
+def _canon_etablissement(value: str | None) -> str:
+    """Même clé canonique que l'attribution administrative des établissements."""
+    value = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
 
 def _appliquer_expiration_si_necessaire(post: Post, db: Session) -> Post:
@@ -50,7 +90,7 @@ def _appliquer_expiration_si_necessaire(post: Post, db: Session) -> Post:
 def _serialiser(post: Post, db: Session) -> dict:
     nb_likes = db.query(PostLike).filter(PostLike.post_id == post.id).count()
     nb_commentaires = db.query(PostCommentaire).filter(PostCommentaire.post_id == post.id).count()
-    return {
+    resultat = {
         "id": post.id,
         "auteur": post.auteur_username,
         "categorie": post.categorie,
@@ -60,19 +100,99 @@ def _serialiser(post: Post, db: Session) -> dict:
         "raison_expiration": post.raison_expiration,
         "media_url": post.media_url,
         "media_type": post.media_type,
+        "document_url": post.document_url,
+        "document_name": post.document_name,
+        "document_type": post.document_type,
+        "etablissement_id": post.etablissement_id,
+        "auteur_type": post.auteur_type,
+        "etablissement_nom": None,
+        "logo_etablissement": None,
         "created_at": post.created_at.isoformat() if post.created_at else None,
         "likes": nb_likes,
         "commentaires": nb_commentaires,
         "auteur_badge": badge_de(db, post.auteur_username),
     }
+    if post.etablissement_id:
+        etab = db.get(Etablissement, post.etablissement_id)
+        prov = db.query(ProviseurCandidature).filter_by(username=post.auteur_username, statut="approuve").first()
+        resultat["etablissement_nom"] = etab.nom if etab else None
+        resultat["logo_etablissement"] = prov.logo_url if prov else None
+    return resultat
+
+
+def _autorisation_etablissement(username: str, etablissement_id: int | None, db: Session, besoin_moderation=False):
+    candidature = db.query(ProviseurCandidature).filter_by(username=username, statut="approuve").first()
+    if candidature is None:
+        return None
+    query = db.query(ProviseurAutorisation).filter_by(candidature_id=candidature.id, actif=1)
+    if etablissement_id is not None:
+        query = query.filter_by(etablissement_id=etablissement_id)
+    autorisation = query.order_by(ProviseurAutorisation.id.asc()).first()
+    if autorisation is None or (besoin_moderation and not autorisation.moderation_locale) or (not besoin_moderation and not autorisation.peut_publier):
+        raise HTTPException(status_code=403, detail="Aucune autorisation active pour cet établissement.")
+    return autorisation
+
+
+def _verifier_acces_post(username: str, post: Post, db: Session):
+    if not post.etablissement_id:
+        return
+    from moderation import role_de, ROLE_ADMIN
+    if role_de(db, username) == ROLE_ADMIN:
+        return
+    candidature = db.query(ProviseurCandidature).filter_by(username=username, statut="approuve").first()
+    if candidature:
+        _autorisation_etablissement(username, post.etablissement_id, db, besoin_moderation=False)
+        return
+    profil = db.get(Profil, username)
+    if profil is None or not profil.etablissement:
+        raise HTTPException(status_code=404, detail="Publication institutionnelle introuvable.")
+    canon = _canon_etablissement(profil.etablissement)
+    etab = db.get(Etablissement, post.etablissement_id)
+    if etab is None or canon != etab.nom_canonique:
+        raise HTTPException(status_code=404, detail="Publication institutionnelle introuvable.")
 
 
 @router.post("/api/posts")
 async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
     username = _identite(data.session_token, db)
-
     if data.categorie not in CATEGORIES_VALIDES:
         raise HTTPException(status_code=400, detail=f"Catégorie invalide, attendu: {CATEGORIES_VALIDES}")
+
+    candidature = db.query(ProviseurCandidature).filter_by(username=username, statut="approuve").first()
+    etablissement_id = None
+    if candidature:
+        if data.categorie != "demonstration":
+            raise HTTPException(status_code=400, detail="Un compte établissement publie des annonces institutionnelles, pas des demandes d'aide élèves.")
+        autorisation = _autorisation_etablissement(username, data.etablissement_id, db, besoin_moderation=False)
+        etablissement_id = autorisation.etablissement_id
+    elif data.etablissement_id is not None:
+        raise HTTPException(status_code=403, detail="Seul un compte établissement autorisé peut publier dans un établissement.")
+
+    contenu = (data.contenu or "").strip()
+    if len(contenu) > 5000:
+        raise HTTPException(status_code=400, detail="La légende ne peut pas dépasser 5 000 caractères.")
+    media_url = (data.media_url or "").strip() or None
+    media_type = data.media_type
+    document_url = (data.document_url or "").strip() or None
+    document_name = (data.document_name or "").strip() or None
+    document_type = (data.document_type or "").strip() or None
+    if media_type not in (None, "image", "video"):
+        raise HTTPException(status_code=400, detail="Type de média non pris en charge.")
+    if media_url and (not media_url.startswith("https://res.cloudinary.com/") or "/grind_posts/" not in media_url or media_type not in ("image", "video")):
+        raise HTTPException(status_code=400, detail="Le média doit provenir du stockage GRIND et posséder un type valide.")
+    if not media_url and media_type:
+        raise HTTPException(status_code=400, detail="Un type de média est fourni sans fichier associé.")
+    if document_url:
+        if not document_url.startswith("https://res.cloudinary.com/") or document_type not in ("application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+            raise HTTPException(status_code=400, detail="Document PDF ou DOCX non valide : il doit provenir du stockage GRIND.")
+        if not document_name or len(document_name) > 180:
+            raise HTTPException(status_code=400, detail="Nom de document invalide.")
+        extension = document_name.lower().rsplit(".", 1)[-1] if "." in document_name else ""
+        extension_attendue = "pdf" if document_type == "application/pdf" else "docx"
+        if extension != extension_attendue or "/grind_documents/" not in document_url:
+            raise HTTPException(status_code=400, detail="Le document ne correspond pas au format ou à l'espace de stockage autorisé.")
+    if not contenu and not media_url and not document_url:
+        raise HTTPException(status_code=400, detail="Ajoute une légende ou un fichier à ta publication.")
 
     date_limite_parsed = None
     if data.categorie == "probleme":
@@ -86,18 +206,15 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
             raise HTTPException(status_code=400, detail="date_limite doit être dans le futur")
 
     post = Post(
-        auteur_username=username,
-        categorie=data.categorie,
-        contenu=data.contenu,
-        date_limite=date_limite_parsed,
-        statut="ouverte" if data.categorie == "probleme" else "publiee",
-        media_url=data.media_url,
-        media_type=data.media_type,
+        auteur_username=username, categorie=data.categorie, contenu=contenu,
+        date_limite=date_limite_parsed, statut="ouverte" if data.categorie == "probleme" else "publiee",
+        media_url=media_url, media_type=media_type, document_url=document_url,
+        document_name=document_name, document_type=document_type,
+        etablissement_id=etablissement_id, auteur_type="proviseur" if candidature else "eleve",
     )
-    db.add(post)
-    db.commit()
-    db.refresh(post)
-
+    db.add(post); db.flush()
+    _creer_notifications_mentions(contenu, username, post.id, db)
+    db.commit(); db.refresh(post)
     return {"success": True, "post": _serialiser(post, db)}
 
 
@@ -110,9 +227,25 @@ async def lister_posts(categorie: str | None = None, session_token: str | None =
         query = query.filter(Post.categorie == categorie)
 
     posts = query.order_by(Post.created_at.desc()).all()
+    # Les publications institutionnelles sont cloisonnées au réseau de l'établissement.
+    lecteur = verifier_session(session_token, db, autoriser_proviseur=True) if session_token else None
+    if lecteur:
+        from moderation import role_de, ROLE_ADMIN
+        if role_de(db, lecteur) != ROLE_ADMIN:
+            candidate = db.query(ProviseurCandidature).filter_by(username=lecteur, statut="approuve").first()
+            if candidate:
+                ids = [a.etablissement_id for a in db.query(ProviseurAutorisation).filter_by(candidature_id=candidate.id, actif=1).all()]
+            else:
+                profil = db.get(Profil, lecteur)
+                key = _canon_etablissement(profil.etablissement if profil else None)
+                ids = [e.id for e in db.query(Etablissement).all() if e.nom_canonique == key] if key else []
+            posts = [p for p in posts if p.etablissement_id is None or p.etablissement_id in ids]
+        else:
+            pass
+    else:
+        posts = [p for p in posts if p.etablissement_id is None]
     # Contenus masqués : comptes sanctionnés (traces gardées) et comptes que le lecteur ne veut plus voir.
     masques = usernames_sanctionnes(db)
-    lecteur = verifier_session(session_token, db) if session_token else None
     if lecteur:
         masques |= bloques_par(db, lecteur)
     posts = [p for p in posts if p.auteur_username not in masques]
@@ -128,6 +261,7 @@ async def toggler_like(post_id: int, data: LikeToggle, db: Session = Depends(get
     post = db.get(Post, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post introuvable")
+    _verifier_acces_post(username, post, db)
 
     existant = db.query(PostLike).filter(
         PostLike.post_id == post_id, PostLike.username == username
@@ -150,9 +284,12 @@ async def commenter(post_id: int, data: CommentaireCreate, db: Session = Depends
     post = db.get(Post, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post introuvable")
+    _verifier_acces_post(username, post, db)
 
     commentaire = PostCommentaire(post_id=post_id, username=username, contenu=data.contenu)
     db.add(commentaire)
+    db.flush()
+    _creer_notifications_mentions(data.contenu, username, post_id, db, commentaire.id)
     db.commit()
     db.refresh(commentaire)
 
@@ -173,13 +310,18 @@ async def lister_commentaires(post_id: int, session_token: str | None = None, db
     post = db.get(Post, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post introuvable")
+    if not session_token:
+        raise HTTPException(status_code=401, detail="Connexion requise pour lire les commentaires.")
+    lecteur = verifier_session(session_token, db, autoriser_proviseur=True)
+    if not lecteur:
+        raise HTTPException(status_code=401, detail="Session GRIND invalide ou expirée")
+    _verifier_acces_post(lecteur, post, db)
 
     commentaires = db.query(PostCommentaire).filter(
         PostCommentaire.post_id == post_id
     ).order_by(PostCommentaire.created_at.asc()).all()
 
     masques = usernames_sanctionnes(db)
-    lecteur = verifier_session(session_token, db) if session_token else None
     if lecteur:
         masques |= bloques_par(db, lecteur)
     commentaires = [c for c in commentaires if c.username not in masques]
@@ -199,6 +341,7 @@ async def resoudre_post(post_id: int, data: ResoudrePost, db: Session = Depends(
     post = db.get(Post, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post introuvable")
+    _verifier_acces_post(username, post, db)
     if post.categorie != "probleme":
         raise HTTPException(status_code=400, detail="Seuls les posts 'probleme' peuvent être résolus")
     if post.auteur_username != username:
@@ -221,6 +364,7 @@ async def expirer_post_manuellement(post_id: int, data: ExpirerPost, db: Session
     post = db.get(Post, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post introuvable")
+    _verifier_acces_post(username, post, db)
     if post.categorie != "probleme":
         raise HTTPException(status_code=400, detail="Seuls les posts 'probleme' peuvent expirer")
     if post.auteur_username != username:
@@ -240,6 +384,7 @@ async def supprimer_post(post_id: int, session_token: str, db: Session = Depends
     post = db.get(Post, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post introuvable")
+    _verifier_acces_post(username, post, db)
     if post.auteur_username != username:
         raise HTTPException(status_code=403, detail="Seul l'auteur peut supprimer ce post")
 
@@ -248,4 +393,38 @@ async def supprimer_post(post_id: int, session_token: str, db: Session = Depends
     db.delete(post)
     db.commit()
 
+    return {"success": True}
+
+
+@router.post("/api/proviseur/posts/{post_id}/moderation")
+async def moderation_locale_post(post_id: int, data: LikeToggle, db: Session = Depends(get_db)):
+    """Retrait local d'un contenu : seulement dans les établissements confiés au proviseur."""
+    username = verifier_session(data.session_token, db, autoriser_proviseur=True)
+    if not username:
+        raise HTTPException(status_code=401, detail="Session invalide.")
+    post = db.get(Post, post_id)
+    if post is None or post.etablissement_id is None:
+        raise HTTPException(status_code=404, detail="Publication institutionnelle introuvable.")
+    _autorisation_etablissement(username, post.etablissement_id, db, besoin_moderation=True)
+    db.query(PostLike).filter(PostLike.post_id == post_id).delete()
+    db.query(PostCommentaire).filter(PostCommentaire.post_id == post_id).delete()
+    db.delete(post); db.commit()
+    return {"success": True}
+
+
+@router.get("/api/notifications")
+async def lister_notifications(session_token: str, db: Session = Depends(get_db)):
+    username = _identite(session_token, db)
+    lignes = db.query(NotificationGrind).filter_by(destinataire_username=username).order_by(NotificationGrind.created_at.desc()).limit(50).all()
+    return {"notifications": [{"id": n.id, "type": n.type, "acteur": n.acteur_username, "post_id": n.post_id, "commentaire_id": n.commentaire_id, "extrait": n.extrait, "lu": bool(n.lu), "created_at": n.created_at.isoformat() if n.created_at else None} for n in lignes]}
+
+
+@router.post("/api/notifications/{notification_id}/lue")
+async def marquer_notification_lue(notification_id: int, data: dict, db: Session = Depends(get_db)):
+    username = _identite(data.get("session_token", ""), db)
+    notif = db.query(NotificationGrind).filter_by(id=notification_id, destinataire_username=username).first()
+    if notif is None:
+        raise HTTPException(status_code=404, detail="Notification introuvable")
+    notif.lu = 1
+    db.commit()
     return {"success": True}

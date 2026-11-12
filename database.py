@@ -20,7 +20,13 @@ RAW_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./grind.db")
 # On retire un éventuel "?ssl-mode=..." de l'URL s'il traîne encore
 # dans la variable d'environnement — on gère le SSL nous-mêmes ci-dessous.
 _parsed = urlparse(RAW_DATABASE_URL)
-DATABASE_URL = urlunparse(_parsed._replace(query=""))
+# urlunparse() transforme sqlite:///./grind.db en sqlite:/./grind.db
+# (URL invalide pour SQLAlchemy). Pour SQLite, on conserve exactement
+# le préfixe et le chemin et on retire seulement les paramètres éventuels.
+if _parsed.scheme == "sqlite":
+    DATABASE_URL = RAW_DATABASE_URL.split("?", 1)[0]
+else:
+    DATABASE_URL = urlunparse(_parsed._replace(query=""))
 
 if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
@@ -69,3 +75,16 @@ def migrer_colonnes_manquantes(base_declarative):
                     print(f"Migration : colonne '{colonne.name}' ajoutée à '{nom_table}'")
                 except Exception as e:
                     print(f"Migration échouée pour {nom_table}.{colonne.name} : {e}")
+
+
+def migrer_index_manquants(base_declarative):
+    """Crée les index déclarés dans les modèles après ajout des colonnes manquantes."""
+    inspecteur = inspect(engine)
+    tables_existantes = set(inspecteur.get_table_names())
+    for table in base_declarative.metadata.tables.values():
+        if table.name not in tables_existantes:
+            continue
+        index_existants = {idx["name"] for idx in inspecteur.get_indexes(table.name) if idx.get("name")}
+        for index in table.indexes:
+            if index.name not in index_existants:
+                index.create(bind=engine, checkfirst=True)
