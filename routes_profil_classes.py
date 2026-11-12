@@ -98,10 +98,20 @@ async def modifier_nom_utilisateur(data: dict, db: Session = Depends(get_db)):
 async def lire_mon_profil(session_token: str, db: Session = Depends(get_db)):
     username = _identite(session_token, db)
     profil = db.get(Profil, username)
+    compte = db.get(CompteGrind, username)
+    profil_complet = bool(
+        profil is not None
+        and profil.age is not None
+        and bool((profil.pays or "").strip())
+        and bool((profil.niveau or "").strip())
+    )
 
     return {
         "username": username,
+        "prenom": compte.prenom if compte else None,
+        "nom": compte.nom if compte else None,
         "profil_existe": profil is not None,
+        "profil_complet": profil_complet,
         "age": profil.age if profil else None,
         "pays": profil.pays if profil else None,
         "niveau": profil.niveau if profil else None,

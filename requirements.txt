@@ -10,4 +10,4 @@ PyJWT
 cryptography
 python-multipart
 
-google-auth>=2.29,<3
+google-auth[requests]>=2.29,<3

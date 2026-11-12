@@ -21,10 +21,10 @@ from sqlalchemy.orm import Session
 
 import mailer
 import verification as vf
-from auth_grind import creer_session, hacher_mot_de_passe, supprimer_session, verifier_mot_de_passe
+from auth_grind import creer_session, hacher_mot_de_passe, supprimer_session, verifier_mot_de_passe, verifier_session
 from database import get_db
 from limiteur import autoriser, noter_echec, oublier, trop_d_echecs
-from models import CompteGrind, GrindSession, VerificationEmail, GrindDeviceAccount
+from models import CompteGrind, GrindSession, VerificationEmail, GrindDeviceAccount, Profil
 from models_proviseur import ProviseurCandidature
 from moderation import (
     ADMIN_USERNAME, CGU_VERSION, ROLE_ADMIN,
@@ -78,6 +78,13 @@ async def _envoyer_gabarit(email: str, gabarit):
 
 def _payload_session(compte: CompteGrind, token: str, db: Session) -> dict:
     candidature = db.query(ProviseurCandidature).filter_by(username=compte.username).first()
+    profil = db.get(Profil, compte.username)
+    profil_complet = bool(
+        profil is not None
+        and profil.age is not None
+        and bool((profil.pays or "").strip())
+        and bool((profil.niveau or "").strip())
+    )
     return {
         "success": True,
         "session_token": token,
@@ -86,6 +93,8 @@ def _payload_session(compte: CompteGrind, token: str, db: Session) -> dict:
         "nom_affiche": compte.nom_affiche,
         "type_compte": "proviseur" if candidature else "eleve",
         "proviseur_statut": candidature.statut if candidature else None,
+        # L'état d'onboarding vient de la base : il ne dépend jamais du navigateur.
+        "profil_complet": True if candidature else profil_complet,
     }
 
 
@@ -487,6 +496,44 @@ async def deconnexion(data: SessionRequest, db: Session = Depends(get_db)):
     db.query(GrindDeviceAccount).filter(GrindDeviceAccount.token_hash == token_hash).delete()
     supprimer_session(data.session_token, db)
     return {"success": True}
+
+
+@router.post("/api/compte/identite")
+async def modifier_identite_compte(data: dict, db: Session = Depends(get_db)):
+    """Permet au titulaire de modifier son prénom et son nom civil."""
+    token = str(data.get("session_token") or "")
+    username = verifier_session(token, db, autoriser_proviseur=True)
+    if username is None:
+        _erreur(401, "session_invalide", "Session GRIND invalide ou expirée — reconnecte-toi.")
+
+    compte = db.get(CompteGrind, username)
+    if compte is None:
+        _erreur(404, "compte_introuvable", "Ce compte GRIND n'existe plus.")
+
+    def normaliser_nom(value, libelle):
+        valeur = unicodedata.normalize("NFC", str(value or ""))
+        valeur = " ".join(valeur.split())
+        if not valeur or len(valeur) > 80:
+            _erreur(400, "identite_invalide", f"{libelle} doit contenir entre 1 et 80 caractères.")
+        contient_lettre = False
+        for caractere in valeur:
+            categorie = unicodedata.category(caractere)
+            if categorie.startswith("L"):
+                contient_lettre = True
+            elif categorie.startswith("M") or caractere in " -'’.·":
+                continue
+            else:
+                _erreur(400, "identite_invalide", f"{libelle} contient un caractère non autorisé.")
+        if not contient_lettre:
+            _erreur(400, "identite_invalide", f"{libelle} doit contenir au moins une lettre.")
+        return valeur
+
+    prenom = normaliser_nom(data.get("prenom"), "Le prénom")
+    nom = normaliser_nom(data.get("nom"), "Le nom")
+    compte.prenom = prenom
+    compte.nom = nom
+    db.commit()
+    return {"success": True, "prenom": prenom, "nom": nom}
 
 
 # ------------------------------------------------------------------ ancien compte : ajouter son e-mail
