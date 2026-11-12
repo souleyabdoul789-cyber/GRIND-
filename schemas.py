@@ -81,6 +81,7 @@ class PostCreate(BaseModel):
     document_url: Optional[str] = None
     document_name: Optional[str] = None
     document_type: Optional[str] = None
+    document_categorie: Optional[str] = None  # matière de classement automatique dans la Library
     etablissement_id: Optional[int] = None
 
 

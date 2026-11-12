@@ -106,6 +106,18 @@ class ConnectionManager:
             if username != sender:
                 await ws.send_json(message)
 
+    async def envoyer_session(self, demande_id: int, cible: str, payload: dict):
+        """Envoie un événement privé à un membre connecté d'une salle."""
+        ws = self.session_connections.get(demande_id, {}).get(cible)
+        if ws is None:
+            return False
+        try:
+            await ws.send_json(payload)
+            return True
+        except Exception:
+            self.disconnect_session(demande_id, cible)
+            return False
+
     async def notifier_depart(self, demande_id: int, username_parti: str):
         """Prévient les participants restants qu'un membre vient de quitter
         la salle — sans ça, l'UI de l'autre le montrerait encore présent."""

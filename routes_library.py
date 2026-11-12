@@ -17,14 +17,8 @@ from media import _envoyer_cloudinary
 
 router = APIRouter()
 
-CATEGORIES = [
-    "Mathématiques", "Français", "Anglais", "Allemand", "Espagnol", "Arabe",
-    "Histoire-Géographie", "Histoire", "Géographie", "Philosophie",
-    "Physique-Chimie", "Physique", "Chimie", "SVT", "Technologie",
-    "Informatique", "NSI", "Économie", "Gestion", "Comptabilité", "Droit",
-    "Éducation civique", "Arts plastiques", "Musique", "EPS", "Électricité",
-    "Mécanique", "Génie civil", "Agriculture", "Sciences économiques et sociales",
-]
+from library_catalog import CATEGORIES
+
 TYPES = {
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",

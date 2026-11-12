@@ -19,6 +19,7 @@ from websocket_routes import router as router_ws
 from media import router as router_media
 from routes_avatar import router as router_avatar
 from routes_livekit import router as router_livekit
+from routes_classe_salle import router as router_classe_salle
 from routes_moderation import router as router_moderation
 from routes_support import router as router_support
 from routes_proviseur import router as router_proviseur
@@ -86,6 +87,7 @@ app.include_router(router_ws)
 app.include_router(router_media)
 app.include_router(router_avatar)
 app.include_router(router_livekit)
+app.include_router(router_classe_salle)
 app.include_router(router_moderation)
 app.include_router(router_support)
 app.include_router(router_proviseur)

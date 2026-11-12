@@ -95,7 +95,8 @@ class Classe(Base):
     matiere = Column(String(64), nullable=True)
     complement = Column(String(40), nullable=True)  # partie libre du nom, contrôlée
     code_invitation = Column(String(32), unique=True, nullable=False, index=True)
-    createur_username = Column(String(64), nullable=False)
+    createur_username = Column(String(64), nullable=False)  # propriétaire immuable de la classe
+    prof_username = Column(String(64), nullable=True, index=True)  # enseignant actuel, transférable sans changer le propriétaire
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -106,7 +107,43 @@ class ClasseMembre(Base):
     classe_id = Column(Integer, ForeignKey("classes.id"), nullable=False, index=True)
     username = Column(String(64), nullable=False)
     role = Column(String(16), default="membre")  # "membre" ou "prof"
+    siege_index = Column(Integer, nullable=True, index=True)  # 0..8 ; NULL pour le prof au bureau avant
+    micro_autorise = Column(Integer, nullable=True, default=1)  # 0 si le professeur a suspendu le droit de parole
     joined_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClasseFeuille(Base):
+    """Feuille personnelle persistante ; privée tant qu’aucune permission n’est accordée."""
+    __tablename__ = "classe_feuilles"
+    __table_args__ = (UniqueConstraint("classe_id", "username", name="uq_classe_feuille_auteur"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    classe_id = Column(Integer, ForeignKey("classes.id", ondelete="CASCADE"), nullable=False, index=True)
+    username = Column(String(64), nullable=False, index=True)
+    contenu = Column(Text, nullable=False, default="")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ClasseFeuillePermission(Base):
+    """Autorisation explicite et persistante de consulter une feuille."""
+    __tablename__ = "classe_feuille_permissions"
+    __table_args__ = (UniqueConstraint("classe_id", "proprietaire_username", "lecteur_username", name="uq_classe_feuille_permission"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    classe_id = Column(Integer, ForeignKey("classes.id", ondelete="CASCADE"), nullable=False, index=True)
+    proprietaire_username = Column(String(64), nullable=False, index=True)
+    lecteur_username = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClasseTableau(Base):
+    """Texte du tableau noir partagé, modifiable uniquement par le professeur actuel."""
+    __tablename__ = "classe_tableaux"
+
+    classe_id = Column(Integer, ForeignKey("classes.id", ondelete="CASCADE"), primary_key=True)
+    contenu = Column(Text, nullable=False, default="")
+    updated_by = Column(String(64), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class DemandeAide(Base):

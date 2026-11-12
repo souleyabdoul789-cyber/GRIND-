@@ -14,9 +14,11 @@ from scolaire import (
 )
 from models_proviseur import ProviseurCandidature, ProviseurAutorisation, Etablissement
 from models import (Profil, Classe, ClasseMembre, CompteGrind, ClasseDiscussion,
-                    ClasseDiscussionMembre, ClasseDiscussionMessage, ClasseDiscussionMention, NotificationGrind)
+                    ClasseDiscussionMembre, ClasseDiscussionMessage, ClasseDiscussionMention, NotificationGrind,
+                    ClasseFeuille, ClasseFeuillePermission, ClasseTableau)
 from discussion_service import assurer_discussion
 from ws_manager import manager
+from classe_salle_service import assurer_prof_et_sieges, prochain_siege
 
 router = APIRouter()
 
@@ -171,13 +173,13 @@ async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
     code = secrets.token_urlsafe(8)
     classe = Classe(
         nom=valide["nom"], niveau=valide["niveau"], matiere=valide["matiere"], complement=valide["complement"],
-        code_invitation=code, createur_username=username,
+        code_invitation=code, createur_username=username, prof_username=username,
     )
     db.add(classe)
     db.commit()
     db.refresh(classe)
 
-    db.add(ClasseMembre(classe_id=classe.id, username=username, role="prof"))
+    db.add(ClasseMembre(classe_id=classe.id, username=username, role="prof", siege_index=None))
     assurer_discussion(db, classe)
     db.commit()
 
@@ -205,13 +207,19 @@ async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db))
         ClasseMembre.username == username,
     ).first()
     if deja_membre:
+        assurer_prof_et_sieges(db, classe)
+        db.commit()
         return {"success": True, "message": "Déjà membre", "classe_id": classe.id}
 
     nb_membres_actuels = db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count()
     if nb_membres_actuels >= 10:
         raise HTTPException(status_code=400, detail="Cette classe a déjà atteint sa limite de 10 élèves")
 
-    db.add(ClasseMembre(classe_id=classe.id, username=username, role="membre"))
+    assurer_prof_et_sieges(db, classe)
+    siege = prochain_siege(db, classe.id)
+    if siege is None:
+        raise HTTPException(status_code=400, detail="Aucun pupitre disponible dans cette classe")
+    db.add(ClasseMembre(classe_id=classe.id, username=username, role="membre", siege_index=siege))
     discussion = assurer_discussion(db, classe)
     db.commit()
 
@@ -232,6 +240,7 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
         classe = db.get(Classe, m.classe_id)
         if classe is None:
             continue
+        assurer_prof_et_sieges(db, classe)
         discussion = assurer_discussion(db, classe)
         nb_membres = db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count()
         nb_discussion = db.query(ClasseDiscussionMembre).filter_by(discussion_id=discussion.id, actif=1).count()
@@ -244,7 +253,9 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
             "role": m.role,
             "code_invitation": classe.code_invitation,
             "nb_membres": nb_membres,
-            "prof_actuel": classe.createur_username,
+            "prof_actuel": classe.prof_username or classe.createur_username,
+            "owner_username": classe.createur_username,
+            "est_owner": username == classe.createur_username,
             "suspendue": sanction_active(db, classe.createur_username) is not None,
             "niveau": classe.niveau,
             "matiere": classe.matiere,
@@ -268,6 +279,7 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
         classe = db.get(Classe, discussion.classe_id)
         if classe is None:
             continue
+        assurer_prof_et_sieges(db, classe)
         nb_membres = db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count()
         nb_discussion = db.query(ClasseDiscussionMembre).filter_by(discussion_id=discussion.id, actif=1).count()
         resultat.append({
@@ -276,7 +288,9 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
             "role": dm.role,
             "code_invitation": classe.code_invitation,
             "nb_membres": nb_membres,
-            "prof_actuel": classe.createur_username,
+            "prof_actuel": classe.prof_username or classe.createur_username,
+            "owner_username": classe.createur_username,
+            "est_owner": username == classe.createur_username,
             "suspendue": sanction_active(db, classe.createur_username) is not None,
             "niveau": classe.niveau,
             "matiere": classe.matiere,
@@ -341,26 +355,46 @@ async def transferer_prof(classe_id: int, data: ClasseTransfererProf, db: Sessio
     classe = db.get(Classe, classe_id)
     if classe is None:
         raise HTTPException(status_code=404, detail="Classe introuvable")
-    if classe.createur_username != username:
-        raise HTTPException(status_code=403, detail="Seul le prof actuel peut céder sa place")
+    assurer_prof_et_sieges(db, classe)
+    professeur = classe.prof_username or classe.createur_username
+    if professeur != username:
+        raise HTTPException(status_code=403, detail="Seul le professeur actuel peut céder son rôle")
 
     nouveau = db.query(ClasseMembre).filter(
         ClasseMembre.classe_id == classe_id, ClasseMembre.username == data.nouveau_prof
     ).first()
     if nouveau is None:
         raise HTTPException(status_code=404, detail="Cette personne n'est pas membre de la classe")
+    if nouveau.username == professeur:
+        return {"success": True, "nouveau_prof": professeur, "owner_username": classe.createur_username}
 
     ancien = db.query(ClasseMembre).filter(
-        ClasseMembre.classe_id == classe_id, ClasseMembre.username == username
+        ClasseMembre.classe_id == classe_id, ClasseMembre.username == professeur
     ).first()
-
-    classe.createur_username = data.nouveau_prof
-    nouveau.role = "prof"
+    # Le nouveau professeur libère son ancien pupitre ; l'ancien professeur
+    # prend exactement ce pupitre, même si la classe était pleine.
+    ancien_siege = nouveau.siege_index if nouveau.siege_index is not None else prochain_siege(db, classe_id)
     if ancien:
         ancien.role = "membre"
+        ancien.siege_index = ancien_siege
+    nouveau.role = "prof"
+    nouveau.siege_index = None
+    # Le propriétaire de la classe ne change jamais lors d'un transfert pédagogique.
+    classe.prof_username = data.nouveau_prof
     db.commit()
+    transfert = {
+        "nouveau_prof": data.nouveau_prof,
+        "ancien_prof": username,
+        "ancien_prof_siege": ancien_siege,
+        "nouveau_prof_siege": None,
+        "owner_username": classe.createur_username,
+    }
+    await manager.envoyer_session(-classe_id, data.nouveau_prof, {
+        "type": "reponse-devenir-prof", "sender": username, "accepte": True, **transfert,
+    })
+    await manager.relay(-classe_id, username, {"type": "prof-change", **transfert})
 
-    return {"success": True, "nouveau_prof": data.nouveau_prof}
+    return {"success": True, **transfert}
 
 
 @router.delete("/api/classes/{classe_id}")
@@ -383,6 +417,9 @@ async def supprimer_classe(classe_id: int, session_token: str, db: Session = Dep
         db.query(ClasseDiscussionMessage).filter_by(discussion_id=discussion.id).delete(synchronize_session=False)
         db.query(ClasseDiscussionMembre).filter_by(discussion_id=discussion.id).delete(synchronize_session=False)
         db.delete(discussion)
+    db.query(ClasseFeuillePermission).filter_by(classe_id=classe_id).delete(synchronize_session=False)
+    db.query(ClasseFeuille).filter_by(classe_id=classe_id).delete(synchronize_session=False)
+    db.query(ClasseTableau).filter_by(classe_id=classe_id).delete(synchronize_session=False)
     db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe_id).delete()
     db.delete(classe)
     db.commit()
