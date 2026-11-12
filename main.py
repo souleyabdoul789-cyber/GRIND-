@@ -29,16 +29,26 @@ METERED_TURN_CREDENTIAL = os.getenv("METERED_TURN_CREDENTIAL")
 
 app = FastAPI(title="GRIND")
 
-_origines_frontend = [
+# Origines explicites autorisées. L'origine de production actuellement utilisée par
+# le frontend est également un défaut sûr : en cas d'oubli de la variable Render,
+# toutes les requêtes navigateur ne doivent pas échouer silencieusement en CORS.
+_origines_defaut = [
+    "https://grind-school-7agz.onrender.com",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+_origines_env = [
     origine.strip().rstrip("/")
-    for origine in os.getenv("GRIND_FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    for origine in os.getenv("GRIND_FRONTEND_ORIGINS", "").split(",")
     if origine.strip()
 ]
+_origines_frontend = list(dict.fromkeys(_origines_defaut + _origines_env))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origines_frontend,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    # PATCH est utilisé par le renommage de classe et le transfert du professeur.
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Accept", "X-Requested-With"],
 )
 
 app.include_router(router_compte)
@@ -65,6 +75,12 @@ def creer_tables():
 @app.get("/")
 async def racine():
     return {"status": "GRIND en ligne"}
+
+
+@app.get("/api/health")
+async def health():
+    """Contrôle de disponibilité sans exposer la configuration ni les secrets."""
+    return {"status": "ok", "service": "grind-api"}
 
 
 @app.post("/api/check-access")

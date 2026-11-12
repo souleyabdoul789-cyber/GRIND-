@@ -12,6 +12,7 @@ Principes (tous appliqués ICI, côté serveur) :
 
 import re
 import secrets
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -332,6 +333,42 @@ async def login(data: CompteGrindLogin, request: Request, taches: BackgroundTask
     return _payload_session(compte, creer_session(compte.username, db), db)
 
 
+def _nom_profil_google_suggere(prenom: str, nom: str, db: Session) -> str:
+    """Construit un nom public lisible, unique et compatible avec les règles GRIND."""
+    brut = f"{prenom}_{nom}".strip("_") or "Membre_GRIND"
+    ascii_brut = unicodedata.normalize("NFKD", brut).encode("ascii", "ignore").decode("ascii")
+    base = re.sub(r"[^A-Za-z]+", "_", ascii_brut).strip("_")
+    if len(base) < 3:
+        base = (base + "_GRIND")[:24].strip("_")
+    base = base[:24].rstrip("_")
+    if not base or not base[0].isalpha():
+        base = "Membre_" + base
+    base = base[:24].rstrip("_")
+
+    # Les suffixes sont alphabétiques pour conserver les règles de nom de profil.
+    candidats = [base]
+    for suffix in "abcdefghijklmnopqrstuvwxyz":
+        candidats.append(base[: 24 - len(suffix)] + suffix)
+    for candidat in candidats:
+        try:
+            valider_pseudo(candidat)
+        except ErreurValidation:
+            continue
+        if not db.query(CompteGrind).filter(func.lower(CompteGrind.username) == candidat.lower()).first():
+            if not nom_reserve(candidat):
+                return candidat
+    # Repli déterministe en cas de collisions nombreuses.
+    for suffix in range(100):
+        candidat = (base[:20].rstrip("_") + "_" + chr(97 + (suffix // 26) % 26) + chr(97 + suffix % 26))[:24]
+        try:
+            valider_pseudo(candidat)
+        except ErreurValidation:
+            continue
+        if not db.query(CompteGrind).filter(func.lower(CompteGrind.username) == candidat.lower()).first() and not nom_reserve(candidat):
+            return candidat
+    raise HTTPException(status_code=503, detail="Impossible de proposer un nom de profil disponible. Réessaie.")
+
+
 @router.post("/api/compte/google")
 async def connexion_google(data: GoogleAuthRequest, db: Session = Depends(get_db)):
     """Connexion/inscription Google : le jeton ID est vérifié côté serveur."""
@@ -354,6 +391,14 @@ async def connexion_google(data: GoogleAuthRequest, db: Session = Depends(get_db
         _erreur(401, "google_identite_non_verifiee", "Google n'a pas confirmé cette adresse e-mail.")
     email = claims.get("email", "").strip()
     sub = claims.get("sub", "").strip()
+    prenom_google = (claims.get("given_name") or "").strip()[:80]
+    nom_google = (claims.get("family_name") or "").strip()[:80]
+    if not prenom_google and not nom_google:
+        # Certains jetons ne contiennent que le champ name ; il est conservé sans
+        # tenter de deviner les frontières du prénom et du nom.
+        nom_complet_google = (claims.get("name") or "").strip()[:160]
+        if nom_complet_google:
+            prenom_google = nom_complet_google[:80]
     try:
         email = valider_email(email)
         canon = email_canonique(email)
@@ -378,10 +423,20 @@ async def connexion_google(data: GoogleAuthRequest, db: Session = Depends(get_db
             compte.email_canonique = canon
             compte.email_verifie = 1
             compte.email_verifie_le = datetime.now(timezone.utc)
+            if prenom_google and not compte.prenom:
+                compte.prenom = prenom_google
+            if nom_google and not compte.nom:
+                compte.nom = nom_google
         else:
             username = (data.username or "").strip()
             if not username:
-                return {"username_requis": True}
+                suggere = _nom_profil_google_suggere(prenom_google, nom_google, db)
+                return {
+                    "username_requis": True,
+                    "suggested_username": suggere,
+                    "prenom": prenom_google,
+                    "nom": nom_google,
+                }
             try:
                 pseudo = valider_pseudo(username)
             except ErreurValidation as erreur:
@@ -403,11 +458,18 @@ async def connexion_google(data: GoogleAuthRequest, db: Session = Depends(get_db
                 email_canonique=canon,
                 email_verifie=1,
                 email_verifie_le=datetime.now(timezone.utc),
+                prenom=prenom_google or None,
+                nom=nom_google or None,
                 google_sub=sub,
             )
             db.add(compte)
     elif compte.email_canonique != canon:
         _erreur(409, "google_email_modifie", "L'adresse du compte Google ne correspond plus à celle liée au compte GRIND.")
+    else:
+        if prenom_google and not compte.prenom:
+            compte.prenom = prenom_google
+        if nom_google and not compte.nom:
+            compte.nom = nom_google
 
     db.commit()
     if compte.username == ADMIN_USERNAME:

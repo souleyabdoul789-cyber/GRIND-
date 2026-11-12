@@ -30,6 +30,9 @@ class CompteGrind(Base):
     email_canonique = Column(String(254), nullable=True, index=True)  # sert à l'unicité (gmail : points/+ ignorés)
     email_verifie = Column(Integer, nullable=True)
     email_verifie_le = Column(DateTime(timezone=True), nullable=True)
+    # Identité civile facultative issue du profil Google (non utilisée comme identifiant public).
+    prenom = Column(String(80), nullable=True)
+    nom = Column(String(80), nullable=True)
     google_sub = Column(String(128), nullable=True, unique=True, index=True)
     pin_hash = Column(String(128), nullable=True)
     pin_echecs = Column(Integer, nullable=True, default=0)
