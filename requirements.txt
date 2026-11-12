@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+httpx
+pydantic
+sqlalchemy
+pymysql
+python-dotenv
+bcrypt
+PyJWT
+cryptography
+python-multipart
+
+google-auth[requests]>=2.29,<3
+
+geoip2
