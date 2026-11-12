@@ -18,6 +18,7 @@ from models import (Profil, Classe, ClasseMembre, CompteGrind, ClasseDiscussion,
                     ClasseFeuille, ClasseFeuillePermission, ClasseTableau)
 from discussion_service import assurer_discussion
 from ws_manager import manager
+from push_notifications import envoyer_push_a_utilisateur
 from classe_salle_service import assurer_prof_et_sieges, prochain_siege
 
 router = APIRouter()
@@ -225,6 +226,11 @@ async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db))
 
     await manager.diffuser_discussion(discussion.id, {"type": "member_joined", "username": username, "nom": username})
     await manager.notifier_nouveau_membre_classe(classe.id, classe.nom, classe.createur_username, username)
+    await envoyer_push_a_utilisateur(
+        db, classe.createur_username, "Nouveau membre dans ta classe",
+        f"{username} a rejoint la classe « {classe.nom} ».",
+        {"event_type": "nouveau_membre_classe", "classe_id": classe.id},
+    )
 
     return {"success": True, "classe_id": classe.id, "nom": classe.nom}
 

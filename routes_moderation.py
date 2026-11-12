@@ -79,6 +79,7 @@ from models import (
 )
 from routes_posts import _serialiser as serialiser_post
 from ws_manager import manager
+from push_notifications import envoyer_push_a_tous
 from account_purge import purger_compte
 
 router = APIRouter()
@@ -724,6 +725,11 @@ async def publier_annonce(data: AdminAnnoncePublier, db: Session = Depends(get_d
     db.add(annonce); db.commit(); db.refresh(annonce)
     payload = _serialiser_annonce(annonce, db)
     await manager.notifier_annonce(payload, exclure=username)
+    await envoyer_push_a_tous(
+        db, f"Annonce GRIND : {titre}", (contenu or "Une nouvelle annonce est disponible.")[:240],
+        {"event_type": "annonce", "annonce_id": annonce.id, "important": annonce.important},
+        exclure=username,
+    )
     return {"success": True, "annonce": payload}
 
 

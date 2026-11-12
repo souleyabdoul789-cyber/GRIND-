@@ -35,6 +35,7 @@ from schemas import (
 )
 from models import SupportConversation, SupportMessage
 from ws_manager import manager
+from push_notifications import envoyer_push_a_utilisateur
 
 router = APIRouter()
 
@@ -316,6 +317,10 @@ async def repondre(data: AdminSupportRepondre, db: Session = Depends(get_db)):
     db.commit()
 
     await manager.notifier_utilisateur(conv.username, {"type": "support_reponse", "conversation_id": conv.id})
+    await envoyer_push_a_utilisateur(
+        db, conv.username, "Réponse de l'équipe GRIND", "L'équipe a répondu à ta demande de support.",
+        {"event_type": "support_reponse", "conversation_id": conv.id},
+    )
     return {"conversation": _resume(db, conv), "messages": _messages(db, conv.id)}
 
 

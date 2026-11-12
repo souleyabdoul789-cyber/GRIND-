@@ -15,6 +15,7 @@ from models import (LibraryPlaylist, LibraryDocument, LibraryDocumentVote,
                     LibraryDocumentComment, NotificationGrind, CompteGrind)
 from library_service import obtenir_playlist_globale
 from media import _envoyer_cloudinary
+from push_notifications import envoyer_notifications_push
 
 router = APIRouter()
 
@@ -72,7 +73,8 @@ async def categories_library():
 
 
 @router.get("/api/library/playlists")
-async def lister_playlists(session_token: str, categorie: str | None = None, q: str | None = None, db: Session = Depends(get_db)):
+async def lister_playlists(session_token: str, categorie: str | None = None, q: str | None = None,
+                           db: Session = Depends(get_db), offset: int = 0, limit: int = 100):
     lecteur = _user(session_token, db)
     obtenir_playlist_globale(db)
     db.commit()
@@ -80,11 +82,14 @@ async def lister_playlists(session_token: str, categorie: str | None = None, q: 
     if q:
         q = q.strip()[:100]
         query = query.filter(or_(LibraryPlaylist.titre.ilike(f"%{q}%"), LibraryPlaylist.description.ilike(f"%{q}%")))
-    playlists = query.order_by(LibraryPlaylist.est_defaut.desc(), LibraryPlaylist.created_at.desc()).limit(100).all()
+    total = query.count()
+    decalage = max(0, int(offset))
+    limite = min(100, max(1, int(limit)))
+    playlists = query.order_by(LibraryPlaylist.est_defaut.desc(), LibraryPlaylist.created_at.desc()).offset(decalage).limit(limite).all()
     result = []
     for p in playlists:
         result.append({"id":p.id,"titre":p.titre,"description":p.description,"categorie":p.categorie,"createur":_identite(db,p.createur_username),"est_defaut":bool(p.est_defaut),"documents":db.query(LibraryDocument).filter_by(playlist_id=p.id).count()})
-    return {"playlists": result, "categories": CATEGORIES}
+    return {"playlists": result, "total": total, "offset": decalage, "limit": limite, "has_more": decalage + len(result) < total}
 
 
 @router.post("/api/library/playlists")
@@ -92,8 +97,12 @@ async def creer_playlist(data: dict, db: Session = Depends(get_db)):
     username = _user(data.get("session_token", ""), db)
     titre = (data.get("titre") or "").strip()
     description = (data.get("description") or "").strip()
-    if len(titre) < 2 or len(titre) > 120:
-        raise HTTPException(status_code=400, detail="Le titre doit contenir entre 2 et 120 caractères.")
+    # Un playsit est une collection libre : seul un nom vide ou trop long est refusé.
+    # Aucun catalogue de matières, motif ou longueur minimale artificielle n'est imposé.
+    import unicodedata
+    titre = unicodedata.normalize("NFC", titre)
+    if not titre or len(titre) > 120:
+        raise HTTPException(status_code=400, detail="Saisis un nom entre 1 et 120 caractères.")
     p = LibraryPlaylist(titre=titre, description=description[:1200] or None, categorie="Général", createur_username=username, public=1)
     db.add(p); db.commit(); db.refresh(p)
     return {"success":True,"playlist":{"id":p.id,"titre":p.titre,"categorie":p.categorie,"description":p.description}}
@@ -154,7 +163,8 @@ async def publier_document_library(
 
 
 @router.get("/api/library/playlists/{playlist_id}/documents")
-async def lister_documents_library(playlist_id: int, session_token: str, q: str | None = None, db: Session = Depends(get_db)):
+async def lister_documents_library(playlist_id: int, session_token: str, q: str | None = None,
+                                   db: Session = Depends(get_db), offset: int = 0, limit: int = 100):
     username = _user(session_token, db)
     p = db.get(LibraryPlaylist, playlist_id)
     if not p or not p.public:
@@ -163,16 +173,24 @@ async def lister_documents_library(playlist_id: int, session_token: str, q: str 
     if q:
         mot = q.strip()[:100]
         query = query.filter(or_(LibraryDocument.titre.ilike(f"%{mot}%"), LibraryDocument.description.ilike(f"%{mot}%"), LibraryDocument.fichier_nom.ilike(f"%{mot}%")))
-    docs = query.order_by(LibraryDocument.created_at.desc()).limit(200).all()
-    return {"playlist":{"id":p.id,"titre":p.titre,"categorie":p.categorie,"description":p.description},"documents":[_doc_payload(db,d,username) for d in docs]}
+    total = query.count()
+    decalage = max(0, int(offset))
+    limite = min(100, max(1, int(limit)))
+    docs = query.order_by(LibraryDocument.created_at.desc(), LibraryDocument.id.desc()).offset(decalage).limit(limite).all()
+    return {
+        "playlist":{"id":p.id,"titre":p.titre,"categorie":p.categorie,"description":p.description},
+        "documents":[_doc_payload(db,d,username) for d in docs],
+        "total": total, "offset": decalage, "limit": limite,
+        "has_more": decalage + len(docs) < total,
+    }
 
 
 @router.get("/api/library/documents")
 async def rechercher_documents_library(
     session_token: str, q: str = "", categorie: str | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db), offset: int = 0, limit: int = 100,
 ):
-    """Recherche globale dans les documents de tous les playsits publics."""
+    """Recherche globale dans les documents et noms de playlists publics, sans filtre de catégorie."""
     username = _user(session_token, db)
     mot = (q or "").strip()[:100]
     query = db.query(LibraryDocument).join(
@@ -184,11 +202,17 @@ async def rechercher_documents_library(
             LibraryDocument.description.ilike(f"%{mot}%"),
             LibraryDocument.fichier_nom.ilike(f"%{mot}%"),
             LibraryPlaylist.titre.ilike(f"%{mot}%"),
-            LibraryDocument.categorie_document.ilike(f"%{mot}%"),
-            LibraryPlaylist.categorie.ilike(f"%{mot}%"),
+            LibraryPlaylist.description.ilike(f"%{mot}%"),
         ))
-    docs = query.order_by(LibraryDocument.created_at.desc()).limit(100).all()
-    return {"documents": [_doc_payload(db, doc, username) for doc in docs]}
+    total = query.count()
+    decalage = max(0, int(offset))
+    limite = min(100, max(1, int(limit)))
+    docs = query.order_by(LibraryDocument.created_at.desc(), LibraryDocument.id.desc()).offset(decalage).limit(limite).all()
+    return {
+        "documents": [_doc_payload(db, doc, username) for doc in docs],
+        "total": total, "offset": decalage, "limit": limite,
+        "has_more": decalage + len(docs) < total,
+    }
 
 
 @router.post("/api/library/documents/{document_id}/vote")
@@ -208,7 +232,9 @@ async def voter_document(document_id: int, data: dict, db: Session = Depends(get
         db.add(LibraryDocumentVote(document_id=document_id, username=username, valeur=valeur))
     if vote_actif and doc.auteur_username != username:
         db.add(NotificationGrind(destinataire_username=doc.auteur_username, acteur_username=username, type="avis_doc", resource_type="library_document", resource_id=doc.id, extrait=f"a évalué « {doc.titre[:160]} »"))
+    notifications_push = [item for item in db.new if isinstance(item, NotificationGrind)]
     db.commit()
+    await envoyer_notifications_push(db, notifications_push)
     return {"success":True}
 
 
@@ -223,7 +249,10 @@ async def commenter_document(document_id: int, data: dict, db: Session = Depends
     db.add(comment)
     if doc.auteur_username != username:
         db.add(NotificationGrind(destinataire_username=doc.auteur_username, acteur_username=username, type="commentaire_doc", resource_type="library_document", resource_id=doc.id, extrait=f"a commenté « {doc.titre[:150]} »"))
-    db.commit(); db.refresh(comment)
+    notifications_push = [item for item in db.new if isinstance(item, NotificationGrind)]
+    db.commit()
+    await envoyer_notifications_push(db, notifications_push)
+    db.refresh(comment)
     return {"success":True,"commentaire":{"id":comment.id,"username":username,"nom":_identite(db,username)["nom"],"contenu":contenu,"date":comment.created_at.isoformat() if comment.created_at else None}}
 
 

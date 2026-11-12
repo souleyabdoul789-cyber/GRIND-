@@ -415,6 +415,18 @@ class NotificationGrind(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class GrindPushToken(Base):
+    """Jeton FCM d'un appareil Android lié au compte actuellement connecté."""
+    __tablename__ = "grind_push_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    token = Column(String(512), nullable=False, unique=True, index=True)
+    username = Column(String(64), ForeignKey("comptes_grind.username"), nullable=False, index=True)
+    platform = Column(String(16), nullable=False, default="android")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class LibraryPlaylist(Base):
     __tablename__ = "library_playlists"
     id = Column(Integer, primary_key=True, autoincrement=True)

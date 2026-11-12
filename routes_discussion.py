@@ -25,6 +25,7 @@ from models import (
 )
 from ws_manager import manager
 from moderation import sanction_active
+from push_notifications import envoyer_notifications_push, envoyer_push_a_utilisateur
 
 router = APIRouter()
 MAX_MESSAGE = 5000
@@ -336,7 +337,9 @@ async def envoyer_message(classe_id: int, data: dict, db: Session = Depends(get_
         db.add(notification)
         destinataires.append((compte.username, notification))
 
+    notifications_push = [notification for _, notification in destinataires]
     db.commit()
+    await envoyer_notifications_push(db, notifications_push)
     db.refresh(message)
     payload = _serialiser_message(db, classe.id, message)
     await manager.diffuser_discussion(discussion.id, {"type": "message", "message": payload})
@@ -577,6 +580,11 @@ async def rejoindre_classe_depuis_discussion(classe_id: int, data: dict, db: Ses
     assurer_discussion(db, classe)
     db.commit()
     await manager.notifier_nouveau_membre_classe(classe.id, classe.nom, classe.createur_username, username)
+    await envoyer_push_a_utilisateur(
+        db, classe.createur_username, "Nouveau membre dans ta classe",
+        f"{username} a rejoint la classe « {classe.nom} ».",
+        {"event_type": "nouveau_membre_classe", "classe_id": classe.id},
+    )
     return {"success": True, "classe_id": classe.id, "deja_membre": False}
 
 

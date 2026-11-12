@@ -8,11 +8,12 @@ from models import (
     AideParticipant, Post, PostLike, PostCommentaire, PostCommentaireLike,
     AvatarConfig, AvatarDeblocage, Signalement, Sanction, SupportConversation,
     SupportMessage, Examen, Blocage, VerificationEmail, NotificationGrind,
-    LibraryPlaylist, LibraryDocument, LibraryDocumentVote, LibraryDocumentComment,
+    LibraryPlaylist, LibraryDocument, LibraryDocumentVote, LibraryDocumentComment, GrindPushToken,
     ClasseDiscussion, ClasseDiscussionMembre, ClasseDiscussionMessage,
     ClasseDiscussionMention, CountryAccessBlock,
 )
 from models_proviseur import ProviseurCandidature, ProviseurDocument, ProviseurAutorisation, Etablissement
+from library_service import obtenir_playlist_globale
 
 
 def purger_compte(db, username: str) -> list[str]:
@@ -148,13 +149,29 @@ def purger_compte(db, username: str) -> list[str]:
     db.query(DemandeAide).filter(DemandeAide.id.in_(owned_help_ids or [-1])).delete(synchronize_session=False)
 
     # Library : playsits créés par la personne et documents qu'elle a partagés.
-    owned_playlist_ids = [x[0] for x in db.query(LibraryPlaylist.id).filter(LibraryPlaylist.createur_username == username).all()]
-    document_ids = [x[0] for x in db.query(LibraryDocument.id).filter(or_(
-        LibraryDocument.auteur_username == username,
-        LibraryDocument.playlist_id.in_(owned_playlist_ids or [-1]),
-    )).all()]
-    for doc in db.query(LibraryDocument).filter(LibraryDocument.id.in_(document_ids or [-1])).all():
-        urls_media.append(doc.fichier_url)
+    owned_playlist_ids = [x[0] for x in db.query(LibraryPlaylist.id).filter(
+        LibraryPlaylist.createur_username == username,
+        LibraryPlaylist.est_defaut != 1,
+    ).all()]
+
+    # Les documents sont la propriété de leur auteur, pas du créateur de la playlist.
+    # Les documents d'autres membres sont conservés et déplacés vers l'espace public global
+    # avant la suppression de la playlist qui les contenait.
+    documents_d_auteurs = db.query(LibraryDocument).filter(
+        LibraryDocument.auteur_username == username
+    ).all()
+    document_ids = [doc.id for doc in documents_d_auteurs]
+    for doc in documents_d_auteurs:
+        if doc.fichier_url:
+            urls_media.append(doc.fichier_url)
+
+    if owned_playlist_ids:
+        playlist_globale = obtenir_playlist_globale(db)
+        db.query(LibraryDocument).filter(
+            LibraryDocument.playlist_id.in_(owned_playlist_ids),
+            LibraryDocument.auteur_username != username,
+        ).update({LibraryDocument.playlist_id: playlist_globale.id}, synchronize_session=False)
+
     db.query(LibraryDocumentVote).filter(or_(
         LibraryDocumentVote.username == username,
         LibraryDocumentVote.document_id.in_(document_ids or [-1]),
@@ -203,6 +220,7 @@ def purger_compte(db, username: str) -> list[str]:
     # Autres données liées au compte.
     db.query(GrindSession).filter_by(username=username).delete(synchronize_session=False)
     db.query(GrindDeviceAccount).filter_by(username=username).delete(synchronize_session=False)
+    db.query(GrindPushToken).filter_by(username=username).delete(synchronize_session=False)
     db.query(Profil).filter_by(username=username).delete(synchronize_session=False)
     db.query(AvatarConfig).filter_by(username=username).delete(synchronize_session=False)
     db.query(AvatarDeblocage).filter_by(username=username).delete(synchronize_session=False)

@@ -6,6 +6,7 @@ from auth_grind import verifier_session
 from schemas import DemandeAideCreate, AideAccepter
 from models import DemandeAide, AideParticipant
 from ws_manager import manager
+from push_notifications import envoyer_push_a_utilisateur, envoyer_push_aux_utilisateurs
 from matching import trouver_meilleurs_candidats
 from scolaire import ErreurValidation, valider_matiere
 
@@ -39,6 +40,10 @@ async def demander_aide(data: DemandeAideCreate, db: Session = Depends(get_db)):
 
     candidats = trouver_meilleurs_candidats(db, username, sujet)
     await manager.notifier_nouvelle_demande(demande.id, demande.sujet, username, candidats)
+    await envoyer_push_aux_utilisateurs(
+        db, candidats, "Nouvelle demande d'aide GRIND", f"Une demande vient d'être publiée en {demande.sujet}.",
+        {"event_type": "nouvelle_demande", "demande_id": demande.id},
+    )
 
     return {"success": True, "demande_id": demande.id, "candidats_notifies": len(candidats)}
 
@@ -72,6 +77,11 @@ async def accepter_demande(data: AideAccepter, db: Session = Depends(get_db)):
     demande.statut = "en_cours"
     db.commit()
 
-    await manager.notifier_participant_rejoint(data.demande_id, username, role)
+    await manager.notifier_participant_rejoint(data.demande_id, username, role, demande.demandeur_username)
+    await envoyer_push_a_utilisateur(
+        db, demande.demandeur_username, "Un membre a rejoint ta demande d'aide",
+        f"{username} a rejoint ta demande en {demande.sujet}.",
+        {"event_type": "participant_rejoint", "demande_id": demande.id},
+    )
 
     return {"success": True, "role": role}

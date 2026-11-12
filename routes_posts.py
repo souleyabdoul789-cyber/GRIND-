@@ -30,6 +30,7 @@ from models import (Post, PostLike, PostCommentaire, PostCommentaireLike, Profil
 from models_proviseur import ProviseurCandidature, ProviseurAutorisation, Etablissement
 from library_service import obtenir_playlist_globale
 from moderation import badge_de, usernames_sanctionnes, bloques_par
+from push_notifications import envoyer_notifications_push
 
 router = APIRouter()
 
@@ -267,7 +268,10 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
             ))
 
     _creer_notifications_mentions(contenu, username, post.id, db)
-    db.commit(); db.refresh(post)
+    notifications_push = [item for item in db.new if isinstance(item, NotificationGrind)]
+    db.commit()
+    await envoyer_notifications_push(db, notifications_push)
+    db.refresh(post)
     return {"success": True, "post": _serialiser(post, db)}
 
 
@@ -328,7 +332,9 @@ async def toggler_like(post_id: int, data: LikeToggle, db: Session = Depends(get
     db.add(PostLike(post_id=post_id, username=username))
     if post.auteur_username != username:
         db.add(NotificationGrind(destinataire_username=post.auteur_username, acteur_username=username, type="like_publication", post_id=post_id, extrait="a aimé ta publication"))
+    notifications_push = [item for item in db.new if isinstance(item, NotificationGrind)]
     db.commit()
+    await envoyer_notifications_push(db, notifications_push)
     return {"success": True, "like": True}
 
 
@@ -368,7 +374,9 @@ async def commenter(post_id: int, data: CommentaireCreate, db: Session = Depends
         db.add(NotificationGrind(destinataire_username=cible, acteur_username=username,
             type="reponse_commentaire" if parent else "commentaire", post_id=post_id,
             commentaire_id=commentaire.id, extrait=("a répondu à ton commentaire" if parent else "a commenté ta publication")))
+    notifications_push = [item for item in db.new if isinstance(item, NotificationGrind)]
     db.commit()
+    await envoyer_notifications_push(db, notifications_push)
     db.refresh(commentaire)
     compte = db.get(CompteGrind, username)
     return {"success": True, "commentaire": {
@@ -433,7 +441,9 @@ async def liker_commentaire(commentaire_id: int, data: LikeToggle, db: Session =
         db.add(PostCommentaireLike(commentaire_id=commentaire_id, username=username)); liked = True
         if commentaire.username != username:
             db.add(NotificationGrind(destinataire_username=commentaire.username, acteur_username=username, type="like_commentaire", post_id=post.id, commentaire_id=commentaire_id, extrait="a aimé ton commentaire"))
+    notifications_push = [item for item in db.new if isinstance(item, NotificationGrind)]
     db.commit()
+    await envoyer_notifications_push(db, notifications_push)
     return {"success": True, "like": liked, "likes": db.query(PostCommentaireLike).filter_by(commentaire_id=commentaire_id).count()}
 
 

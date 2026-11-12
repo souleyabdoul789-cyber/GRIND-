@@ -27,6 +27,7 @@ from routes_security import router as router_security
 from routes_library import router as router_library
 from routes_access import router as router_access, detecter_pays
 from routes_discussion import router as router_discussion
+from routes_push import router as router_push
 from models import CountryAccessBlock
 
 METERED_TURN_USERNAME = os.getenv("METERED_TURN_USERNAME")
@@ -96,6 +97,7 @@ app.include_router(router_security)
 app.include_router(router_library)
 app.include_router(router_access)
 app.include_router(router_discussion)
+app.include_router(router_push)
 
 
 @app.on_event("startup")

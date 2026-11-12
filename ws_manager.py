@@ -41,9 +41,9 @@ class ConnectionManager:
             if ws:
                 await ws.send_json(payload)
 
-    async def notifier_participant_rejoint(self, demande_id: int, username: str, role: str):
+    async def notifier_participant_rejoint(self, demande_id: int, username: str, role: str, destinataire: str):
         payload = {"type": "participant_rejoint", "demande_id": demande_id, "username": username, "role": role}
-        ws = self.notif_connections.get(username)
+        ws = self.notif_connections.get(destinataire)
         if ws:
             await ws.send_json(payload)
 
