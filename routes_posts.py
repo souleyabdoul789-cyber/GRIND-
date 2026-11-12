@@ -15,6 +15,7 @@ Comme partout ailleurs : l'identité vient de la session GRIND
 """
 
 from datetime import datetime, timezone
+import json
 import re
 import unicodedata
 from fastapi import APIRouter, Depends, HTTPException
@@ -24,7 +25,7 @@ from sqlalchemy import or_
 from database import get_db
 from auth_grind import verifier_session
 from schemas import PostCreate, CommentaireCreate, LikeToggle, ResoudrePost, ExpirerPost
-from models import Post, PostLike, PostCommentaire, Profil, CompteGrind, NotificationGrind
+from models import Post, PostLike, PostCommentaire, PostCommentaireLike, Profil, CompteGrind, NotificationGrind
 from models_proviseur import ProviseurCandidature, ProviseurAutorisation, Etablissement
 from moderation import badge_de, usernames_sanctionnes, bloques_par
 
@@ -87,6 +88,18 @@ def _appliquer_expiration_si_necessaire(post: Post, db: Session) -> Post:
     return post
 
 
+def _medias_post(post: Post) -> list[dict]:
+    try:
+        items = json.loads(post.medias_json or "[]")
+        if isinstance(items, list) and items:
+            return items[:10]
+    except (TypeError, ValueError):
+        pass
+    if post.media_url:
+        return [{"url": post.media_url, "type": post.media_type or "image"}]
+    return []
+
+
 def _serialiser(post: Post, db: Session) -> dict:
     nb_likes = db.query(PostLike).filter(PostLike.post_id == post.id).count()
     nb_commentaires = db.query(PostCommentaire).filter(PostCommentaire.post_id == post.id).count()
@@ -100,6 +113,7 @@ def _serialiser(post: Post, db: Session) -> dict:
         "raison_expiration": post.raison_expiration,
         "media_url": post.media_url,
         "media_type": post.media_type,
+        "media_items": _medias_post(post),
         "document_url": post.document_url,
         "document_name": post.document_name,
         "document_type": post.document_type,
@@ -191,7 +205,19 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
         extension_attendue = "pdf" if document_type == "application/pdf" else "docx"
         if extension != extension_attendue or "/grind_documents/" not in document_url:
             raise HTTPException(status_code=400, detail="Le document ne correspond pas au format ou à l'espace de stockage autorisé.")
-    if not contenu and not media_url and not document_url:
+    media_items = []
+    for item in (data.media_items or []):
+        if not isinstance(item, dict) or item.get("type") not in ("image", "video"):
+            raise HTTPException(status_code=400, detail="Un élément de la galerie est invalide.")
+        url = str(item.get("url") or "").strip()
+        if not url.startswith("https://res.cloudinary.com/") or "/grind_posts/" not in url:
+            raise HTTPException(status_code=400, detail="Chaque média doit provenir du stockage GRIND.")
+        media_items.append({"url": url, "type": item["type"]})
+    if len(media_items) > 10:
+        raise HTTPException(status_code=400, detail="Une publication accepte au maximum 10 images ou médias.")
+    if media_items and media_url:
+        raise HTTPException(status_code=400, detail="Utilise la galerie ou le média unique, pas les deux.")
+    if not contenu and not media_url and not media_items and not document_url:
         raise HTTPException(status_code=400, detail="Ajoute une légende ou un fichier à ta publication.")
 
     date_limite_parsed = None
@@ -205,11 +231,13 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
         if date_limite_parsed <= datetime.now(date_limite_parsed.tzinfo or timezone.utc):
             raise HTTPException(status_code=400, detail="date_limite doit être dans le futur")
 
+
     post = Post(
         auteur_username=username, categorie=data.categorie, contenu=contenu,
         date_limite=date_limite_parsed, statut="ouverte" if data.categorie == "probleme" else "publiee",
-        media_url=media_url, media_type=media_type, document_url=document_url,
-        document_name=document_name, document_type=document_type,
+        media_url=media_url, media_type=media_type,
+        medias_json=json.dumps(media_items, ensure_ascii=False) if media_items else None,
+        document_url=document_url, document_name=document_name, document_type=document_type,
         etablissement_id=etablissement_id, auteur_type="proviseur" if candidature else "eleve",
     )
     db.add(post); db.flush()
@@ -273,6 +301,8 @@ async def toggler_like(post_id: int, data: LikeToggle, db: Session = Depends(get
         return {"success": True, "like": False}
 
     db.add(PostLike(post_id=post_id, username=username))
+    if post.auteur_username != username:
+        db.add(NotificationGrind(destinataire_username=post.auteur_username, acteur_username=username, type="like_publication", post_id=post_id, extrait="a aimé ta publication"))
     db.commit()
     return {"success": True, "like": True}
 
@@ -286,23 +316,45 @@ async def commenter(post_id: int, data: CommentaireCreate, db: Session = Depends
         raise HTTPException(status_code=404, detail="Post introuvable")
     _verifier_acces_post(username, post, db)
 
-    commentaire = PostCommentaire(post_id=post_id, username=username, contenu=data.contenu)
+    contenu = (data.contenu or "").strip()
+    media_url = (data.media_url or "").strip() or None
+    document_url = (data.document_url or "").strip() or None
+    if len(contenu) > 2000:
+        raise HTTPException(status_code=400, detail="Le commentaire est limité à 2 000 caractères.")
+    if media_url and (not media_url.startswith("https://res.cloudinary.com/") or "/grind_posts/" not in media_url or data.media_type != "image"):
+        raise HTTPException(status_code=400, detail="La pièce jointe image doit provenir du stockage GRIND.")
+    if data.media_type not in (None, "image"):
+        raise HTTPException(status_code=400, detail="Les commentaires acceptent les images, pas les vidéos.")
+    if document_url and (not document_url.startswith("https://res.cloudinary.com/") or data.document_type not in ("application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")):
+        raise HTTPException(status_code=400, detail="Le document joint doit être un PDF ou DOCX du stockage GRIND.")
+    if not (contenu or media_url or document_url):
+        raise HTTPException(status_code=400, detail="Ajoute un texte ou une pièce jointe.")
+    parent = db.get(PostCommentaire, data.parent_id) if data.parent_id else None
+    if data.parent_id and (parent is None or parent.post_id != post_id):
+        raise HTTPException(status_code=404, detail="Commentaire parent introuvable.")
+    commentaire = PostCommentaire(post_id=post_id, username=username, contenu=contenu, parent_id=data.parent_id,
+        media_url=media_url, media_type=data.media_type, document_url=document_url,
+        document_name=(data.document_name or "")[:180] or None, document_type=data.document_type)
     db.add(commentaire)
     db.flush()
-    _creer_notifications_mentions(data.contenu, username, post_id, db, commentaire.id)
+    _creer_notifications_mentions(contenu, username, post_id, db, commentaire.id)
+    cible = parent.username if parent else post.auteur_username
+    if cible != username:
+        db.add(NotificationGrind(destinataire_username=cible, acteur_username=username,
+            type="reponse_commentaire" if parent else "commentaire", post_id=post_id,
+            commentaire_id=commentaire.id, extrait=("a répondu à ton commentaire" if parent else "a commenté ta publication")))
     db.commit()
     db.refresh(commentaire)
-
-    return {
-        "success": True,
-        "commentaire": {
-            "id": commentaire.id,
-            "username": commentaire.username,
-            "badge": badge_de(db, commentaire.username),
-            "contenu": commentaire.contenu,
-            "created_at": commentaire.created_at.isoformat() if commentaire.created_at else None,
-        },
-    }
+    compte = db.get(CompteGrind, username)
+    return {"success": True, "commentaire": {
+        "id": commentaire.id, "username": username,
+        "nom": " ".join(x for x in [compte.prenom, compte.nom] if x).strip() if compte else username,
+        "badge": badge_de(db, username), "contenu": commentaire.contenu,
+        "parent_id": commentaire.parent_id, "media_url": commentaire.media_url,
+        "media_type": commentaire.media_type, "document_url": commentaire.document_url,
+        "document_name": commentaire.document_name, "document_type": commentaire.document_type,
+        "likes": 0, "created_at": commentaire.created_at.isoformat() if commentaire.created_at else None,
+    }}
 
 
 @router.get("/api/posts/{post_id}/commentaires")
@@ -328,10 +380,52 @@ async def lister_commentaires(post_id: int, session_token: str | None = None, db
 
     return {
         "commentaires": [
-            {"id": c.id, "username": c.username, "badge": badge_de(db, c.username), "contenu": c.contenu, "created_at": c.created_at.isoformat() if c.created_at else None}
+            {"id": c.id, "username": c.username,
+             "nom": (" ".join(x for x in [db.get(CompteGrind, c.username).prenom, db.get(CompteGrind, c.username).nom] if x).strip() if db.get(CompteGrind, c.username) else c.username),
+             "badge": badge_de(db, c.username), "contenu": c.contenu, "parent_id": c.parent_id,
+             "media_url": c.media_url, "media_type": c.media_type, "document_url": c.document_url,
+             "document_name": c.document_name, "document_type": c.document_type,
+             "likes": db.query(PostCommentaireLike).filter_by(commentaire_id=c.id).count(),
+             "aime": db.query(PostCommentaireLike).filter_by(commentaire_id=c.id, username=lecteur).first() is not None,
+             "created_at": c.created_at.isoformat() if c.created_at else None}
             for c in commentaires
         ]
     }
+
+
+@router.post("/api/commentaires/{commentaire_id}/like")
+async def liker_commentaire(commentaire_id: int, data: LikeToggle, db: Session = Depends(get_db)):
+    username = _identite(data.session_token, db)
+    commentaire = db.get(PostCommentaire, commentaire_id)
+    if commentaire is None:
+        raise HTTPException(status_code=404, detail="Commentaire introuvable.")
+    post = db.get(Post, commentaire.post_id)
+    _verifier_acces_post(username, post, db)
+    vote = db.query(PostCommentaireLike).filter_by(commentaire_id=commentaire_id, username=username).first()
+    if vote:
+        db.delete(vote); liked = False
+    else:
+        db.add(PostCommentaireLike(commentaire_id=commentaire_id, username=username)); liked = True
+        if commentaire.username != username:
+            db.add(NotificationGrind(destinataire_username=commentaire.username, acteur_username=username, type="like_commentaire", post_id=post.id, commentaire_id=commentaire_id, extrait="a aimé ton commentaire"))
+    db.commit()
+    return {"success": True, "like": liked, "likes": db.query(PostCommentaireLike).filter_by(commentaire_id=commentaire_id).count()}
+
+
+@router.post("/api/posts/{post_id}/modifier")
+async def modifier_post(post_id: int, data: dict, db: Session = Depends(get_db)):
+    username = _identite(data.get("session_token", ""), db)
+    post = db.get(Post, post_id)
+    if post is None:
+        raise HTTPException(status_code=404, detail="Publication introuvable.")
+    if post.auteur_username != username:
+        raise HTTPException(status_code=403, detail="Tu peux uniquement modifier ta propre légende.")
+    contenu = (data.get("contenu") or "").strip()
+    if len(contenu) > 5000:
+        raise HTTPException(status_code=400, detail="La légende est limitée à 5 000 caractères.")
+    post.contenu = contenu
+    db.commit()
+    return {"success": True, "contenu": contenu}
 
 
 @router.post("/api/posts/{post_id}/resoudre")
@@ -412,11 +506,32 @@ async def moderation_locale_post(post_id: int, data: LikeToggle, db: Session = D
     return {"success": True}
 
 
+@router.get("/api/utilisateurs/suggestions")
+async def suggestions_utilisateurs(session_token: str, q: str = "", db: Session = Depends(get_db)):
+    lecteur = verifier_session(session_token, db, autoriser_proviseur=True)
+    if not lecteur:
+        raise HTTPException(status_code=401, detail="Session GRIND invalide.")
+    terme = (q or "").strip().lstrip("@").lower()[:24]
+    query = db.query(CompteGrind).filter(CompteGrind.role.is_(None))
+    if terme:
+        query = query.filter(CompteGrind.username.ilike(f"{terme}%"))
+    rows = query.order_by(CompteGrind.username.asc()).limit(12).all()
+    return {"utilisateurs": [{"username": c.username, "nom": " ".join(x for x in [c.prenom, c.nom] if x).strip() or c.username, "avatar": None} for c in rows]}
+
+
 @router.get("/api/notifications")
 async def lister_notifications(session_token: str, db: Session = Depends(get_db)):
     username = _identite(session_token, db)
     lignes = db.query(NotificationGrind).filter_by(destinataire_username=username).order_by(NotificationGrind.created_at.desc()).limit(50).all()
-    return {"notifications": [{"id": n.id, "type": n.type, "acteur": n.acteur_username, "post_id": n.post_id, "commentaire_id": n.commentaire_id, "extrait": n.extrait, "lu": bool(n.lu), "created_at": n.created_at.isoformat() if n.created_at else None} for n in lignes]}
+    notifications = []
+    for n in lignes:
+        acteur = db.get(CompteGrind, n.acteur_username)
+        notifications.append({"id": n.id, "type": n.type, "acteur": n.acteur_username,
+            "acteur_nom": " ".join(x for x in [acteur.prenom, acteur.nom] if x).strip() if acteur else n.acteur_username,
+            "post_id": n.post_id, "commentaire_id": n.commentaire_id,
+            "resource_type": n.resource_type, "resource_id": n.resource_id,
+            "extrait": n.extrait, "lu": bool(n.lu), "created_at": n.created_at.isoformat() if n.created_at else None})
+    return {"notifications": notifications}
 
 
 @router.post("/api/notifications/{notification_id}/lue")

@@ -178,6 +178,7 @@ async def signup(data: CompteGrindSignup, request: Request, taches: BackgroundTa
         email=email,
         email_canonique=canon,
         email_verifie=0,
+        bienvenue_vue=0,
     )
     db.add(compte)
     db.commit()
@@ -470,6 +471,7 @@ async def connexion_google(data: GoogleAuthRequest, db: Session = Depends(get_db
                 prenom=prenom_google or None,
                 nom=nom_google or None,
                 google_sub=sub,
+                bienvenue_vue=0,
             )
             db.add(compte)
     elif compte.email_canonique != canon:

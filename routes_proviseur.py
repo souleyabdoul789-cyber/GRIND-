@@ -147,6 +147,7 @@ async def deposer_candidature(
         email=None,
         email_canonique=None,
         email_verifie=None,  # aucune adresse e-mail ; le statut du dossier fait foi pour le parcours direction
+        bienvenue_vue=0,
     )
     db.add(compte)
     db.flush()

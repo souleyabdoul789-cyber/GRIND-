@@ -77,6 +77,7 @@ class PostCreate(BaseModel):
     date_limite: Optional[str] = None  # ISO 8601, requis si categorie == "probleme"
     media_url: Optional[str] = None
     media_type: Optional[str] = None  # "image" ou "video"
+    media_items: Optional[list[dict]] = None  # galerie jusqu’à 10 médias
     document_url: Optional[str] = None
     document_name: Optional[str] = None
     document_type: Optional[str] = None
@@ -86,6 +87,12 @@ class PostCreate(BaseModel):
 class CommentaireCreate(BaseModel):
     session_token: str
     contenu: str
+    parent_id: Optional[int] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
+    document_url: Optional[str] = None
+    document_name: Optional[str] = None
+    document_type: Optional[str] = None
 
 
 class LikeToggle(BaseModel):

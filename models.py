@@ -38,6 +38,7 @@ class CompteGrind(Base):
     pin_echecs = Column(Integer, nullable=True, default=0)
     pin_bloque_jusqua = Column(DateTime(timezone=True), nullable=True)
     premium_until = Column(DateTime(timezone=True), nullable=True)  # entitlement premium vérifié côté serveur
+    bienvenue_vue = Column(Integer, nullable=True, default=1)  # 0 uniquement pour un nouveau compte à qui montrer l’accueil
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -151,6 +152,7 @@ class Post(Base):
     raison_expiration = Column(Text, nullable=True)
     media_url = Column(String(512), nullable=True)
     media_type = Column(String(8), nullable=True)  # "image", "video" ou "document"
+    medias_json = Column(Text, nullable=True)  # galerie de médias (jusqu’à 10), rétrocompatible avec media_url
     document_url = Column(String(512), nullable=True)
     document_name = Column(String(180), nullable=True)
     document_type = Column(String(80), nullable=True)
@@ -176,6 +178,21 @@ class PostCommentaire(Base):
     post_id = Column(Integer, ForeignKey("posts.id"), nullable=False, index=True)
     username = Column(String(64), nullable=False)
     contenu = Column(Text, nullable=False)
+    parent_id = Column(Integer, nullable=True, index=True)
+    media_url = Column(String(512), nullable=True)
+    media_type = Column(String(16), nullable=True)
+    document_url = Column(String(512), nullable=True)
+    document_name = Column(String(180), nullable=True)
+    document_type = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PostCommentaireLike(Base):
+    __tablename__ = "post_commentaire_likes"
+    __table_args__ = (UniqueConstraint("commentaire_id", "username", name="uq_post_commentaire_like"),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    commentaire_id = Column(Integer, ForeignKey("post_commentaires.id"), nullable=False, index=True)
+    username = Column(String(64), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -353,6 +370,63 @@ class NotificationGrind(Base):
     type = Column(String(24), nullable=False)
     post_id = Column(Integer, nullable=True)
     commentaire_id = Column(Integer, nullable=True)
+    resource_type = Column(String(32), nullable=True)
+    resource_id = Column(Integer, nullable=True)
     extrait = Column(String(240), nullable=True)
     lu = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class LibraryPlaylist(Base):
+    __tablename__ = "library_playlists"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    titre = Column(String(120), nullable=False)
+    description = Column(Text, nullable=True)
+    categorie = Column(String(64), nullable=False, index=True)
+    createur_username = Column(String(64), nullable=False, index=True)
+    est_defaut = Column(Integer, nullable=False, default=0)
+    public = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class LibraryDocument(Base):
+    __tablename__ = "library_documents"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    playlist_id = Column(Integer, ForeignKey("library_playlists.id"), nullable=False, index=True)
+    auteur_username = Column(String(64), nullable=False, index=True)
+    titre = Column(String(180), nullable=False)
+    description = Column(Text, nullable=True)
+    fichier_url = Column(String(700), nullable=False)
+    fichier_nom = Column(String(180), nullable=False)
+    fichier_type = Column(String(120), nullable=False)
+    taille_octets = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class LibraryDocumentVote(Base):
+    __tablename__ = "library_document_votes"
+    __table_args__ = (UniqueConstraint("document_id", "username", name="uq_library_document_vote"),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    document_id = Column(Integer, ForeignKey("library_documents.id"), nullable=False, index=True)
+    username = Column(String(64), nullable=False, index=True)
+    valeur = Column(Integer, nullable=False)  # +1 / -1
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class LibraryDocumentComment(Base):
+    __tablename__ = "library_document_comments"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    document_id = Column(Integer, ForeignKey("library_documents.id"), nullable=False, index=True)
+    username = Column(String(64), nullable=False, index=True)
+    contenu = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CountryAccessBlock(Base):
+    __tablename__ = "country_access_blocks"
+    code = Column(String(8), primary_key=True)
+    nom = Column(String(100), nullable=False)
+    message = Column(Text, nullable=True)
+    actif = Column(Integer, nullable=False, default=1)
+    modifie_par = Column(String(64), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

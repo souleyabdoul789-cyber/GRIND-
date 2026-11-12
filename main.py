@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()  # charge le fichier .env AVANT tout le reste — doit rester la 1ère ligne utile
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from database import Base, engine, get_db, migrer_colonnes_manquantes, migrer_index_manquants
@@ -23,11 +23,37 @@ from routes_moderation import router as router_moderation
 from routes_support import router as router_support
 from routes_proviseur import router as router_proviseur
 from routes_security import router as router_security
+from routes_library import router as router_library
+from routes_access import router as router_access, detecter_pays
+from models import CountryAccessBlock
 
 METERED_TURN_USERNAME = os.getenv("METERED_TURN_USERNAME")
 METERED_TURN_CREDENTIAL = os.getenv("METERED_TURN_CREDENTIAL")
 
 app = FastAPI(title="GRIND")
+from fastapi.responses import JSONResponse
+
+@app.middleware("http")
+async def bloquer_pays_suspendus(request: Request, call_next):
+    chemin = request.url.path
+    chemins_autorises = {
+        "/api/health", "/api/country-access", "/api/compte/login",
+        "/api/compte/logout", "/api/moderation/moi",
+    }
+    acces_securite = chemin.startswith("/api/security/pin/")
+    gestion_pays_admin = chemin.startswith("/api/admin/countries")
+    if chemin.startswith("/api/") and chemin not in chemins_autorises and not acces_securite and not gestion_pays_admin:
+        code = detecter_pays(request)
+        if code:
+            from database import SessionLocal
+            db = SessionLocal()
+            try:
+                bloc = db.query(CountryAccessBlock).filter_by(code=code, actif=1).first()
+                if bloc:
+                    return JSONResponse(status_code=451, content={"detail": {"code":"country_unavailable", "message": bloc.message or "GRIND est temporairement indisponible dans ce pays.", "country": bloc.nom}})
+            finally:
+                db.close()
+    return await call_next(request)
 
 # Origines explicites autorisées. L'origine de production actuellement utilisée par
 # le frontend est également un défaut sûr : en cas d'oubli de la variable Render,
@@ -63,6 +89,8 @@ app.include_router(router_moderation)
 app.include_router(router_support)
 app.include_router(router_proviseur)
 app.include_router(router_security)
+app.include_router(router_library)
+app.include_router(router_access)
 
 
 @app.on_event("startup")

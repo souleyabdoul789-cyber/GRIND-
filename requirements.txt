@@ -11,3 +11,5 @@ cryptography
 python-multipart
 
 google-auth[requests]>=2.29,<3
+
+geoip2
