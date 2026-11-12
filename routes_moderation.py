@@ -14,7 +14,8 @@ navigation ou un journal de serveur.
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -41,6 +42,7 @@ from schemas import (
     AdminListeSignalements,
     AdminTraiter,
     AdminRechercheUtilisateurs,
+    AdminSupprimerCompte,
     AdminSanctionner,
     AdminLever,
     AdminNom,
@@ -71,9 +73,13 @@ from models import (
     Blocage,
     Classe,
     ClasseMembre,
+    ClasseDiscussion,
+    ClasseDiscussionMessage,
+    LibraryDocument,
 )
 from routes_posts import _serialiser as serialiser_post
 from ws_manager import manager
+from account_purge import purger_compte
 
 router = APIRouter()
 
@@ -516,6 +522,83 @@ async def chercher_utilisateurs(data: AdminRechercheUtilisateurs, db: Session = 
             } if sanction else None,
         })
     return {"utilisateurs": resultat}
+
+
+@router.post("/api/admin/comptes/supprimer")
+async def supprimer_compte_definitivement(data: AdminSupprimerCompte, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Suppression définitive réservée au compte administrateur officiel."""
+    acteur, role = _acteur(data.session_token, db, "utilisateurs")
+    if role != ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="Seul l'administrateur GRIND peut supprimer définitivement un compte.")
+
+    cible = (data.username or "").strip()
+    confirmation = (data.confirmation_username or "").strip()
+    if not cible:
+        raise HTTPException(status_code=400, detail="Compte cible manquant.")
+    if cible == ADMIN_USERNAME or cible == acteur:
+        raise HTTPException(status_code=403, detail="Le compte administrateur officiel ne peut jamais être supprimé.")
+    if confirmation != cible:
+        raise HTTPException(status_code=400, detail="La confirmation doit correspondre exactement au nom du compte.")
+    if db.get(CompteGrind, cible) is None:
+        raise HTTPException(status_code=404, detail="Compte GRIND introuvable.")
+
+    classes_supprimees = [row[0] for row in db.query(Classe.id).filter(Classe.createur_username == cible).all()]
+    discussions_classes_supprimees = db.query(ClasseDiscussion.id).join(
+        Classe, Classe.id == ClasseDiscussion.classe_id
+    ).filter(Classe.createur_username == cible).all()
+    discussions_a_transferer = db.query(ClasseDiscussion.id).filter(ClasseDiscussion.owner_username == cible).all()
+    discussions_supprimees_ids = [row[0] for row in discussions_classes_supprimees]
+    discussions_ids = list(dict.fromkeys(discussions_supprimees_ids + [row[0] for row in discussions_a_transferer]))
+    try:
+        urls_media = purger_compte(db, cible)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="La suppression a échoué ; aucune modification partielle n'a été validée.")
+
+    # Révoque les connexions actives après validation de la transaction.
+    manager.disconnect_notif(cible)
+    # Les canaux audio/WebRTC des classes supprimées sont fermés pour tous les participants.
+    for classe_id in classes_supprimees:
+        canal_id = -classe_id
+        for membre, websocket in list(manager.session_connections.get(canal_id, {}).items()):
+            try:
+                await websocket.close(code=1008, reason="Classe supprimée par l'administration")
+            except Exception:
+                pass
+            manager.disconnect_session(canal_id, membre)
+    # Dans les classes conservées, seule la connexion du compte supprimé est révoquée.
+    for classe_id, membres in list(manager.session_connections.items()):
+        if cible in membres:
+            manager.disconnect_session(classe_id, cible)
+    for discussion_id in discussions_supprimees_ids:
+        await manager.fermer_discussion(discussion_id)
+    for discussion_id, membres in list(manager.discussion_connections.items()):
+        if cible in membres:
+            await manager.retirer_connexions_discussion(discussion_id, cible)
+
+    # Les fichiers Cloudinary sont détruits seulement après validation SQL.
+    # Une URL encore référencée par un autre compte est préservée.
+    from models_proviseur import ProviseurCandidature
+    urls_a_supprimer = []
+    for url in dict.fromkeys(urls_media):
+        if not url:
+            continue
+        encore_utilise = (
+            db.query(Post.id).filter(or_(Post.media_url == url, Post.document_url == url, Post.medias_json.like(f"%{url}%"))).first()
+            or db.query(PostCommentaire.id).filter(or_(PostCommentaire.media_url == url, PostCommentaire.document_url == url)).first()
+            or db.query(LibraryDocument.id).filter(LibraryDocument.fichier_url == url).first()
+            or db.query(ClasseDiscussionMessage.id).filter(ClasseDiscussionMessage.piece_url == url).first()
+            or db.query(ClasseDiscussion.photo_url).filter(ClasseDiscussion.photo_url == url).first()
+            or db.query(ProviseurCandidature.id).filter(ProviseurCandidature.logo_url == url).first()
+            or db.query(Annonce.id).filter(or_(Annonce.media_url == url, Annonce.document_url == url)).first()
+        )
+        if not encore_utilise:
+            urls_a_supprimer.append(url)
+    from media import supprimer_assets_cloudinary
+    if urls_a_supprimer:
+        background_tasks.add_task(supprimer_assets_cloudinary, urls_a_supprimer)
+    return {"success": True, "username": cible, "nettoyage_medias_programme": len(urls_a_supprimer)}
 
 
 @router.post("/api/admin/sanctionner")

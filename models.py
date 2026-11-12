@@ -438,6 +438,7 @@ class LibraryDocument(Base):
     fichier_nom = Column(String(180), nullable=False)
     fichier_type = Column(String(120), nullable=False)
     taille_octets = Column(Integer, nullable=True)
+    categorie_document = Column(String(120), nullable=True, index=True)  # libre, distincte du playsit
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -6,6 +6,7 @@ Aucun secret Cloudinary n'est envoyé au navigateur.
 """
 
 import hashlib
+import logging
 import math
 import os
 import re
@@ -25,6 +26,7 @@ from database import get_db
 from auth_grind import verifier_session
 
 router = APIRouter()
+logger = logging.getLogger("grind.media")
 
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
@@ -371,3 +373,60 @@ async def uploader_logo_proviseur(
     if not url or not url.startswith("https://res.cloudinary.com/"):
         raise HTTPException(status_code=502, detail="Cloudinary n'a pas retourné de logo exploitable.")
     return {"logo_url": url}
+
+
+def supprimer_assets_cloudinary(urls: list[str]) -> dict:
+    """Supprime les assets Cloudinary GRIND connus après une purge DB réussie.
+
+    Retourne des compteurs ; l'absence de credentials ne bloque jamais la purge SQL.
+    """
+    if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
+        logger.warning("Purge Cloudinary ignorée : identifiants serveur absents (%s fichiers)", len(urls))
+        return {"supprimes": 0, "non_supprimes": len(urls)}
+    from urllib.parse import urlparse
+    import re
+    uniques = list(dict.fromkeys(u for u in urls if isinstance(u, str) and u.startswith("https://res.cloudinary.com/")))
+    supprimes = 0
+    non_supprimes = 0
+    with httpx.Client(timeout=httpx.Timeout(20.0, connect=8.0), follow_redirects=False) as client:
+        for url in uniques:
+            try:
+                parsed = urlparse(url)
+                morceaux = [x for x in parsed.path.split("/") if x]
+                upload_index = morceaux.index("upload")
+                resource_type = morceaux[upload_index - 1]
+                if resource_type not in ("image", "video", "raw"):
+                    non_supprimes += 1
+                    continue
+                reste = morceaux[upload_index + 1:]
+                # Les dossiers GRIND servent de borne fiable après les éventuelles transformations.
+                debut = next((i for i, part in enumerate(reste) if part.startswith("grind_")), None)
+                if debut is None:
+                    version = next((i for i, part in enumerate(reste) if re.fullmatch(r"v\d+", part)), None)
+                    debut = version + 1 if version is not None else 0
+                public_id = "/".join(reste[debut:])
+                if not public_id:
+                    non_supprimes += 1
+                    continue
+                if resource_type in ("image", "video"):
+                    public_id = re.sub(r"\.[A-Za-z0-9]+$", "", public_id)
+                timestamp = int(time.time())
+                params = {"invalidate": "true", "public_id": public_id, "timestamp": timestamp}
+                donnees = {
+                    "api_key": CLOUDINARY_API_KEY,
+                    "timestamp": str(timestamp),
+                    "public_id": public_id,
+                    "invalidate": "true",
+                    "signature": _signer(params),
+                }
+                endpoint = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/{resource_type}/destroy"
+                response = client.post(endpoint, data=donnees)
+                resultat = response.json() if response.content else {}
+                if response.status_code == 200 and resultat.get("result") in ("ok", "not found"):
+                    supprimes += 1
+                else:
+                    non_supprimes += 1
+            except Exception:
+                non_supprimes += 1
+    logger.info("Purge Cloudinary compte GRIND : %s asset(s) supprimé(s), %s non supprimé(s)", supprimes, non_supprimes)
+    return {"supprimes": supprimes, "non_supprimes": non_supprimes}

@@ -13,6 +13,7 @@ from database import get_db
 from auth_grind import verifier_session
 from models import (LibraryPlaylist, LibraryDocument, LibraryDocumentVote,
                     LibraryDocumentComment, NotificationGrind, CompteGrind)
+from library_service import obtenir_playlist_globale
 from media import _envoyer_cloudinary
 
 router = APIRouter()
@@ -42,13 +43,8 @@ def _identite(db: Session, username: str):
     return {"username": username, "nom": " ".join(x for x in [compte.prenom, compte.nom] if x).strip() or username, "avatar": None}
 
 
-def _playlist_par_defaut(db: Session, categorie: str, username: str):
-    p = db.query(LibraryPlaylist).filter_by(categorie=categorie, est_defaut=1).first()
-    if p:
-        return p
-    p = LibraryPlaylist(titre=f"Ressources — {categorie}", description=f"Documents publics classés en {categorie}.", categorie=categorie, createur_username="GRIND", est_defaut=1, public=1)
-    db.add(p); db.flush()
-    return p
+def _playlist_par_defaut(db: Session, categorie: str | None = None, username: str | None = None):
+    return obtenir_playlist_globale(db)
 
 
 def _doc_payload(db: Session, doc: LibraryDocument, lecteur: str):
@@ -59,7 +55,7 @@ def _doc_payload(db: Session, doc: LibraryDocument, lecteur: str):
     auteur = _identite(db, doc.auteur_username)
     return {
         "id": doc.id, "playlist_id": doc.playlist_id, "playlist": playlist.titre if playlist else "Library",
-        "categorie": playlist.categorie if playlist else "Autres", "auteur": auteur,
+        "categorie": doc.categorie_document, "auteur": auteur,
         "titre": doc.titre, "description": doc.description, "fichier_url": doc.fichier_url,
         "fichier_nom": doc.fichier_nom, "fichier_type": doc.fichier_type,
         "taille_octets": doc.taille_octets,
@@ -78,9 +74,9 @@ async def categories_library():
 @router.get("/api/library/playlists")
 async def lister_playlists(session_token: str, categorie: str | None = None, q: str | None = None, db: Session = Depends(get_db)):
     lecteur = _user(session_token, db)
+    obtenir_playlist_globale(db)
+    db.commit()
     query = db.query(LibraryPlaylist).filter(LibraryPlaylist.public == 1)
-    if categorie and categorie in CATEGORIES:
-        query = query.filter(LibraryPlaylist.categorie == categorie)
     if q:
         q = q.strip()[:100]
         query = query.filter(or_(LibraryPlaylist.titre.ilike(f"%{q}%"), LibraryPlaylist.description.ilike(f"%{q}%")))
@@ -95,28 +91,27 @@ async def lister_playlists(session_token: str, categorie: str | None = None, q: 
 async def creer_playlist(data: dict, db: Session = Depends(get_db)):
     username = _user(data.get("session_token", ""), db)
     titre = (data.get("titre") or "").strip()
-    categorie = (data.get("categorie") or "").strip()
     description = (data.get("description") or "").strip()
     if len(titre) < 2 or len(titre) > 120:
         raise HTTPException(status_code=400, detail="Le titre doit contenir entre 2 et 120 caractères.")
-    if categorie not in CATEGORIES:
-        raise HTTPException(status_code=400, detail="Choisis une catégorie scolaire valide.")
-    p = LibraryPlaylist(titre=titre, description=description[:1200] or None, categorie=categorie, createur_username=username, public=1)
+    p = LibraryPlaylist(titre=titre, description=description[:1200] or None, categorie="Général", createur_username=username, public=1)
     db.add(p); db.commit(); db.refresh(p)
     return {"success":True,"playlist":{"id":p.id,"titre":p.titre,"categorie":p.categorie,"description":p.description}}
 
 
 @router.post("/api/library/documents")
 async def publier_document_library(
-    session_token: str = Form(...), categorie: str = Form(...), titre: str = Form(...),
+    session_token: str = Form(...), categorie: str = Form(""), titre: str = Form(...),
     description: str = Form(""), playlist_id: int | None = Form(None), file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     username = _user(session_token, db)
+    obtenir_playlist_globale(db)
     extension = Path(file.filename or "").suffix.lower()
     mime = TYPES.get(extension)
-    if not mime or categorie not in CATEGORIES:
-        raise HTTPException(status_code=415, detail="Format ou catégorie non pris en charge.")
+    if not mime:
+        raise HTTPException(status_code=415, detail="Format de document non pris en charge.")
+    categorie_document = (categorie or "").strip()[:120] or None
     filename = Path(file.filename or "document").name[:180]
     file.file.seek(0, 2); size = file.file.tell(); file.file.seek(0)
     if size <= 0 or size > 30 * 1024 * 1024:
@@ -143,19 +138,17 @@ async def publier_document_library(
         except UnicodeDecodeError:
             raise HTTPException(status_code=415, detail="Le CSV doit être encodé en UTF-8.")
     p = db.get(LibraryPlaylist, playlist_id) if playlist_id else None
-    if p and p.categorie != categorie:
-        raise HTTPException(status_code=400, detail="Un document ne peut être ajouté qu’à une playlist de la même catégorie.")
     if p and not p.public:
         raise HTTPException(status_code=403, detail="Cette playlist n’est pas publique.")
     if not p:
-        p = _playlist_par_defaut(db, categorie, username)
+        p = _playlist_par_defaut(db, categorie_document, username)
     import media as media_service
     params = {"folder":"grind_library", "allowed_formats":"pdf,docx,xlsx,xls,csv"}
     result = await media_service._envoyer_cloudinary(file, filename, mime, "raw", params)
     url = result.get("secure_url")
     if not url or not url.startswith("https://res.cloudinary.com/"):
         raise HTTPException(status_code=502, detail="Le stockage n’a pas retourné un fichier exploitable.")
-    doc = LibraryDocument(playlist_id=p.id, auteur_username=username, titre=titre.strip()[:180] or filename, description=description.strip()[:2000] or None, fichier_url=url, fichier_nom=filename, fichier_type=mime, taille_octets=size)
+    doc = LibraryDocument(playlist_id=p.id, auteur_username=username, titre=titre.strip()[:180] or filename, description=description.strip()[:2000] or None, fichier_url=url, fichier_nom=filename, fichier_type=mime, taille_octets=size, categorie_document=categorie_document)
     db.add(doc); db.commit(); db.refresh(doc)
     return {"success":True,"document":_doc_payload(db,doc,username)}
 
@@ -185,14 +178,13 @@ async def rechercher_documents_library(
     query = db.query(LibraryDocument).join(
         LibraryPlaylist, LibraryPlaylist.id == LibraryDocument.playlist_id
     ).filter(LibraryPlaylist.public == 1)
-    if categorie and categorie in CATEGORIES:
-        query = query.filter(LibraryPlaylist.categorie == categorie)
     if mot:
         query = query.filter(or_(
             LibraryDocument.titre.ilike(f"%{mot}%"),
             LibraryDocument.description.ilike(f"%{mot}%"),
             LibraryDocument.fichier_nom.ilike(f"%{mot}%"),
             LibraryPlaylist.titre.ilike(f"%{mot}%"),
+            LibraryDocument.categorie_document.ilike(f"%{mot}%"),
             LibraryPlaylist.categorie.ilike(f"%{mot}%"),
         ))
     docs = query.order_by(LibraryDocument.created_at.desc()).limit(100).all()

@@ -27,8 +27,8 @@ from auth_grind import verifier_session
 from schemas import PostCreate, CommentaireCreate, LikeToggle, ResoudrePost, ExpirerPost
 from models import (Post, PostLike, PostCommentaire, PostCommentaireLike, Profil, CompteGrind, NotificationGrind,
                     LibraryPlaylist, LibraryDocument)
-from library_catalog import CATEGORIES as CATEGORIES_LIBRARY
 from models_proviseur import ProviseurCandidature, ProviseurAutorisation, Etablissement
+from library_service import obtenir_playlist_globale
 from moderation import badge_de, usernames_sanctionnes, bloques_par
 
 router = APIRouter()
@@ -130,8 +130,7 @@ def _serialiser(post: Post, db: Session) -> dict:
     }
     if post.document_url:
         document_library = db.query(LibraryDocument).filter_by(fichier_url=post.document_url).first()
-        playlist_library = db.get(LibraryPlaylist, document_library.playlist_id) if document_library else None
-        resultat["document_categorie"] = playlist_library.categorie if playlist_library else None
+        resultat["document_categorie"] = document_library.categorie_document if document_library else None
     else:
         resultat["document_categorie"] = None
     if post.etablissement_id:
@@ -205,8 +204,7 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
     if not media_url and media_type:
         raise HTTPException(status_code=400, detail="Un type de média est fourni sans fichier associé.")
     if document_url:
-        if data.document_categorie not in CATEGORIES_LIBRARY:
-            raise HTTPException(status_code=400, detail="Choisis une matière valide pour classer ce document dans la Library.")
+        categorie_document = (data.document_categorie or "").strip()[:120] or None
         if not document_url.startswith("https://res.cloudinary.com/") or document_type not in ("application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
             raise HTTPException(status_code=400, detail="Document PDF ou DOCX non valide : il doit provenir du stockage GRIND.")
         if not document_name or len(document_name) > 180:
@@ -215,8 +213,8 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
         extension_attendue = "pdf" if document_type == "application/pdf" else "docx"
         if extension != extension_attendue or "/grind_documents/" not in document_url:
             raise HTTPException(status_code=400, detail="Le document ne correspond pas au format ou à l'espace de stockage autorisé.")
-    elif data.document_categorie:
-        raise HTTPException(status_code=400, detail="Une catégorie Library ne peut être fournie sans document joint.")
+    elif data.document_categorie and data.document_categorie.strip():
+        raise HTTPException(status_code=400, detail="Une catégorie de document ne peut être fournie sans document joint.")
     media_items = []
     for item in (data.media_items or []):
         if not isinstance(item, dict) or item.get("type") not in ("image", "video"):
@@ -254,30 +252,18 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
     )
     db.add(post); db.flush()
 
-    # Tout PDF/DOCX joint à une publication entre aussi dans la Library publique
-    # de sa matière. Le fichier n'est pas ré-uploader : la même ressource sécurisée
-    # Cloudinary est référencée par la publication et par le catalogue documentaire.
+    # Tout PDF/DOCX joint à une publication entre dans la Library globale.
+    # La catégorie (facultative et libre) appartient au document, jamais au playsit.
     if document_url:
-        playlist = db.query(LibraryPlaylist).filter_by(categorie=data.document_categorie, est_defaut=1).first()
-        if not playlist:
-            playlist = LibraryPlaylist(
-                titre=f"Ressources — {data.document_categorie}",
-                description=f"Documents publics classés en {data.document_categorie}.",
-                categorie=data.document_categorie, createur_username="GRIND",
-                est_defaut=1, public=1,
-            )
-            db.add(playlist); db.flush()
+        playlist = obtenir_playlist_globale(db)
         deja_reference = db.query(LibraryDocument).filter_by(fichier_url=document_url).first()
-        if deja_reference:
-            ancienne_playlist = db.get(LibraryPlaylist, deja_reference.playlist_id)
-            if ancienne_playlist and ancienne_playlist.categorie != data.document_categorie:
-                raise HTTPException(status_code=409, detail="Ce fichier est déjà classé dans une autre matière. Réimporte-le pour le classer différemment.")
-        else:
+        if not deja_reference:
             db.add(LibraryDocument(
                 playlist_id=playlist.id, auteur_username=username,
                 titre=(document_name or "Document")[:180],
                 description=contenu[:2000] or None, fichier_url=document_url,
                 fichier_nom=document_name, fichier_type=document_type,
+                categorie_document=categorie_document,
             ))
 
     _creer_notifications_mentions(contenu, username, post.id, db)
