@@ -64,6 +64,7 @@ _origines_defaut = [
     "https://grind-school-7agz.onrender.com",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://localhost",  # origine locale du WebView Capacitor Android
 ]
 _origines_env = [
     origine.strip().rstrip("/")
