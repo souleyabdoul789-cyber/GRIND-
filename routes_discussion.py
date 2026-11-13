@@ -21,7 +21,7 @@ from database import get_db
 from discussion_service import assurer_discussion, MAX_MEMBRES_DISCUSSION
 from models import (
     Classe, ClasseMembre, ClasseDiscussion, ClasseDiscussionMembre,
-    ClasseDiscussionMessage, ClasseDiscussionMention, CompteGrind,
+    ClasseDiscussionMessage, ClasseDiscussionMessageMasque, ClasseDiscussionMention, CompteGrind,
     NotificationGrind,
 )
 from ws_manager import manager
@@ -87,6 +87,8 @@ def _serialiser_message(db: Session, classe_id: int, message: ClasseDiscussionMe
                    "mime": message.piece_mime, "taille": message.piece_taille}
                   if message.piece_url else None),
         "created_at": message.created_at.isoformat() if message.created_at else None,
+        "modifie": bool(getattr(message, "modifie", 0)),
+        "modifie_le": message.modifie_le.isoformat() if getattr(message, "modifie_le", None) else None,
     }
 
 
@@ -164,9 +166,11 @@ async def obtenir_discussion(classe_id: int, session_token: str, db: Session = D
     membres = db.query(ClasseDiscussionMembre).filter_by(discussion_id=discussion.id, actif=1).order_by(
         ClasseDiscussionMembre.role.asc(), ClasseDiscussionMembre.joined_at.asc()
     ).all()
-    messages = db.query(ClasseDiscussionMessage).filter_by(discussion_id=discussion.id).order_by(
-        ClasseDiscussionMessage.id.desc()
-    ).limit(50).all()
+    messages_masques = db.query(ClasseDiscussionMessageMasque.message_id).filter_by(username=username)
+    messages = db.query(ClasseDiscussionMessage).filter(
+        ClasseDiscussionMessage.discussion_id == discussion.id,
+        ~ClasseDiscussionMessage.id.in_(messages_masques),
+    ).order_by(ClasseDiscussionMessage.id.desc()).limit(50).all()
     mentions = db.query(ClasseDiscussionMention).join(
         ClasseDiscussionMessage, ClasseDiscussionMessage.id == ClasseDiscussionMention.message_id
     ).filter(
@@ -201,7 +205,11 @@ async def lister_messages(classe_id: int, session_token: str, before_id: int | N
     classe, discussion = _classe_et_discussion(db, classe_id)
     _membre(db, discussion.id, username)
     limite = max(1, min(int(limit or 50), MAX_PAGE))
-    q = db.query(ClasseDiscussionMessage).filter_by(discussion_id=discussion.id)
+    messages_masques = db.query(ClasseDiscussionMessageMasque.message_id).filter_by(username=username)
+    q = db.query(ClasseDiscussionMessage).filter(
+        ClasseDiscussionMessage.discussion_id == discussion.id,
+        ~ClasseDiscussionMessage.id.in_(messages_masques),
+    )
     if before_id:
         q = q.filter(ClasseDiscussionMessage.id < before_id)
         rows = q.order_by(ClasseDiscussionMessage.id.desc()).limit(limite).all()
@@ -285,6 +293,37 @@ async def obtenir_piece_message(
         raise HTTPException(status_code=502, detail="Le stockage de pièce jointe est temporairement indisponible.")
 
 
+def _creer_notifications_message(db: Session, classe: Classe, discussion: ClasseDiscussion,
+                                 message: ClasseDiscussionMessage, auteur: str, extrait: str,
+                                 exclus: set[str] | None = None):
+    exclus = set(exclus or ()) | {auteur}
+    usernames = [row[0] for row in db.query(ClasseDiscussionMembre.username).filter_by(
+        discussion_id=discussion.id, actif=1
+    ).all() if row[0] not in exclus]
+    notifications = []
+    for cible in usernames:
+        notification = NotificationGrind(
+            destinataire_username=cible, acteur_username=auteur, type="message_classe",
+            resource_type="classe_discussion_message", resource_id=message.id,
+            classe_id=classe.id, extrait=(extrait or "Nouveau message")[:180],
+        )
+        db.add(notification)
+        notifications.append(notification)
+    return notifications
+
+
+async def _diffuser_notifications_discussion(db: Session, notifications):
+    for notification in notifications or []:
+        await manager.notifier_utilisateur(notification.destinataire_username, {
+            "type": "persistante", "id": f"notification-{notification.id}",
+            "notificationId": notification.id, "eventType": notification.type,
+            "acteur": notification.acteur_username,
+            "acteur_nom": _nom_compte(db, notification.acteur_username),
+            "resource_type": notification.resource_type, "resource_id": notification.resource_id,
+            "classe_id": notification.classe_id, "extrait": notification.extrait, "lu": False,
+        })
+
+
 @router.post("/api/classes/{classe_id}/discussion/vocaux")
 async def envoyer_vocal_discussion(
     classe_id: int,
@@ -334,7 +373,11 @@ async def envoyer_vocal_discussion(
         piece_taille=piece["taille"],
     )
     db.add(message)
+    db.flush()
+    notifications = _creer_notifications_message(db, classe, discussion, message, username, "Message vocal")
     db.commit()
+    await envoyer_notifications_push(db, notifications)
+    await _diffuser_notifications_discussion(db, notifications)
     db.refresh(message)
     payload = _serialiser_message(db, classe.id, message)
     await manager.diffuser_discussion(discussion.id, {"type": "message", "message": payload})
@@ -377,6 +420,7 @@ async def envoyer_message(classe_id: int, data: dict, db: Session = Depends(get_
     db.flush()
 
     destinataires = []
+    usernames_mentionnes = set()
     for pseudo in dict.fromkeys(re.findall(r"(?<![A-Za-z0-9_])@([A-Za-z_]{3,24})", contenu)):
         compte = db.query(CompteGrind).filter(func.lower(CompteGrind.username) == pseudo.lower()).first()
         if not compte or compte.username == username:
@@ -387,6 +431,7 @@ async def envoyer_message(classe_id: int, data: dict, db: Session = Depends(get_
         if not membre_cible:
             continue  # un tag n'accorde jamais l'accès à un groupe privé
         db.add(ClasseDiscussionMention(message_id=message.id, username=compte.username))
+        usernames_mentionnes.add(compte.username)
         notification = NotificationGrind(
             destinataire_username=compte.username,
             acteur_username=username,
@@ -399,9 +444,13 @@ async def envoyer_message(classe_id: int, data: dict, db: Session = Depends(get_
         db.add(notification)
         destinataires.append((compte.username, notification))
 
-    notifications_push = [notification for _, notification in destinataires]
+    notifications_mentions = [notification for _, notification in destinataires]
+    notifications_generiques = _creer_notifications_message(
+        db, classe, discussion, message, username, contenu[:180] or "Nouveau message", usernames_mentionnes
+    )
     db.commit()
-    await envoyer_notifications_push(db, notifications_push)
+    await envoyer_notifications_push(db, notifications_mentions + notifications_generiques)
+    await _diffuser_notifications_discussion(db, notifications_generiques)
     db.refresh(message)
     payload = _serialiser_message(db, classe.id, message)
     await manager.diffuser_discussion(discussion.id, {"type": "message", "message": payload})
@@ -414,6 +463,51 @@ async def envoyer_message(classe_id: int, data: dict, db: Session = Depends(get_
             "classe_id": classe.id, "extrait": payload["contenu"][:180], "lu": False,
         })
     return {"success": True, "message": payload}
+
+
+@router.patch("/api/classes/{classe_id}/discussion/messages/{message_id}")
+async def modifier_message_discussion(classe_id: int, message_id: int, data: dict, db: Session = Depends(get_db)):
+    username = _identite(data.get("session_token", ""), db)
+    classe, discussion = _classe_et_discussion(db, classe_id)
+    _membre(db, discussion.id, username)
+    message = db.query(ClasseDiscussionMessage).filter_by(id=message_id, discussion_id=discussion.id).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message introuvable.")
+    if message.auteur_username != username:
+        raise HTTPException(status_code=403, detail="Tu peux uniquement modifier tes propres messages.")
+    if message.piece_url:
+        raise HTTPException(status_code=400, detail="Les messages avec pièce jointe ne peuvent pas être modifiés.")
+    cree = message.created_at or datetime.now(timezone.utc)
+    if cree.tzinfo is None:
+        cree = cree.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - cree > timedelta(minutes=15):
+        raise HTTPException(status_code=403, detail="Le délai de modification de 15 minutes est dépassé.")
+    contenu = str(data.get("contenu") or "").strip()
+    if not contenu or len(contenu) > MAX_MESSAGE:
+        raise HTTPException(status_code=400, detail=f"Le message doit contenir entre 1 et {MAX_MESSAGE} caractères.")
+    message.contenu = contenu
+    message.modifie = 1
+    message.modifie_le = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(message)
+    payload = _serialiser_message(db, classe.id, message)
+    await manager.diffuser_discussion(discussion.id, {"type": "message_updated", "message": payload})
+    return {"success": True, "message": payload}
+
+
+@router.delete("/api/classes/{classe_id}/discussion/messages/{message_id}/pour-moi")
+async def masquer_message_discussion(classe_id: int, message_id: int, data: dict, db: Session = Depends(get_db)):
+    username = _identite(data.get("session_token", ""), db)
+    _, discussion = _classe_et_discussion(db, classe_id)
+    _membre(db, discussion.id, username)
+    message = db.query(ClasseDiscussionMessage).filter_by(id=message_id, discussion_id=discussion.id).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message introuvable.")
+    existe = db.query(ClasseDiscussionMessageMasque.id).filter_by(message_id=message_id, username=username).first()
+    if not existe:
+        db.add(ClasseDiscussionMessageMasque(message_id=message_id, username=username))
+        db.commit()
+    return {"success": True, "message_id": message_id, "supprime_pour_moi": True}
 
 
 @router.get("/api/classes/{classe_id}/discussion/membres")

@@ -125,26 +125,70 @@ async def envoyer_push_a_tous(db, title, body, data=None, exclure=None):
 
 
 async def envoyer_notifications_push(db, notifications):
-    """Envoie les notifications persistantes déjà validées en base ; l'échec FCM ne bloque jamais GRIND."""
+    """Envoie les notifications persistantes déjà validées en base, en un seul lot FCM.
+
+    Les messages de groupe peuvent toucher beaucoup de membres. Regrouper les
+    destinataires évite d'attendre une requête réseau séquentielle par personne.
+    L'échec FCM ne bloque jamais l'enregistrement ni la diffusion GRIND.
+    """
     notifications = [n for n in (notifications or []) if getattr(n, "id", None)]
     if not notifications:
         return
+
+    configuration = _configuration_fcm()
+    if not configuration:
+        return
+    project_id, service_account_info = configuration
+
+    bodies = {
+        "mention": "t'a mentionné",
+        "mention_classe": "t'a mentionné dans une discussion de classe",
+        "message_classe": "a envoyé un message dans une discussion de classe",
+        "like_publication": "a aimé ta publication",
+        "commentaire": "a commenté ta publication",
+        "reponse_commentaire": "a répondu à ton commentaire",
+        "like_commentaire": "a aimé ton commentaire",
+        "avis_doc": "a évalué un document de ta Library",
+        "commentaire_doc": "a commenté un document de ta Library",
+    }
+
+    par_destinataire = {}
     for notification in notifications:
         acteur = db.get(CompteGrind, notification.acteur_username)
-        acteur_nom = " ".join(x for x in [getattr(acteur, "prenom", None), getattr(acteur, "nom", None)] if x).strip() if acteur else notification.acteur_username
-        bodies = {
-            "mention": f"{acteur_nom} t'a mentionné",
-            "mention_classe": f"{acteur_nom} t'a mentionné dans une discussion de classe",
-            "like_publication": f"{acteur_nom} a aimé ta publication",
-            "commentaire": f"{acteur_nom} a commenté ta publication",
-            "reponse_commentaire": f"{acteur_nom} a répondu à ton commentaire",
-            "like_commentaire": f"{acteur_nom} a aimé ton commentaire",
-            "avis_doc": f"{acteur_nom} a évalué un document de ta Library",
-            "commentaire_doc": f"{acteur_nom} a commenté un document de ta Library",
+        acteur_nom = " ".join(
+            x for x in [getattr(acteur, "prenom", None), getattr(acteur, "nom", None)] if x
+        ).strip() if acteur else notification.acteur_username
+        phrase = bodies.get(notification.type, "a interagi avec ton contenu")
+        body = f"{acteur_nom} {phrase}"
+        extrait = (notification.extrait or "").strip()
+        if extrait and notification.type != "mention_classe":
+            body = f"{body} · {extrait}"[:240]
+        payload = {
+            "title": "GRIND",
+            "body": body[:240],
+            "data": _message_data(notification),
         }
-        body = bodies.get(notification.type, f"{acteur_nom} a interagi avec ton contenu")
-        excerpt = (notification.extrait or "").strip()
-        if excerpt and notification.type not in ("mention_classe",):
-            body = f"{body} · {excerpt}"[:240]
-        data = _message_data(notification)
-        await envoyer_push_a_utilisateur(db, notification.destinataire_username, "GRIND", body, data)
+        par_destinataire.setdefault(notification.destinataire_username, []).append(payload)
+
+    rows = db.query(GrindPushToken).filter(
+        GrindPushToken.username.in_(list(par_destinataire))
+    ).all()
+    messages = [
+        (row.token, payload)
+        for row in rows
+        for payload in par_destinataire.get(row.username, [])
+    ]
+    if not messages:
+        return
+
+    try:
+        invalid = await asyncio.to_thread(
+            _envoyer_batch_fcm, project_id, service_account_info, messages
+        )
+        if invalid:
+            db.query(GrindPushToken).filter(
+                GrindPushToken.token.in_(list(invalid))
+            ).delete(synchronize_session=False)
+            db.commit()
+    except Exception as exc:
+        logger.warning("Le relais FCM a échoué sans interrompre GRIND : %s", exc)

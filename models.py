@@ -532,6 +532,19 @@ class ClasseDiscussionMessage(Base):
     piece_nom = Column(String(180), nullable=True)
     piece_mime = Column(String(120), nullable=True)
     piece_taille = Column(Integer, nullable=True)
+    modifie = Column(Integer, nullable=True, default=0)
+    modifie_le = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClasseDiscussionMessageMasque(Base):
+    """Masquage individuel d'un message : supprimer pour moi sans toucher aux autres."""
+    __tablename__ = "classe_discussion_messages_masques"
+    __table_args__ = (UniqueConstraint("message_id", "username", name="uq_discussion_message_masque"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message_id = Column(Integer, ForeignKey("classe_discussion_messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    username = Column(String(64), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
