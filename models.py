@@ -399,6 +399,43 @@ class VerificationEmail(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class InscriptionEnAttente(Base):
+    """Inscription isolée jusqu'à la validation e-mail, du PIN puis du nom public.
+
+    Cette table ne remplace jamais comptes_grind : le véritable username n'est
+    créé dans la table des comptes qu'à la dernière étape de l'onboarding.
+    Les colonnes de vérification reprennent le contrat utilisé par verification.py.
+    """
+    __tablename__ = "inscriptions_en_attente"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    objet = Column(String(20), nullable=False, default="inscription")
+    username = Column(String(64), nullable=True, index=True)  # compatibilité du flux générique
+    email = Column(String(254), nullable=False)
+    email_canonique = Column(String(254), nullable=True, unique=True, index=True)
+    password_hash = Column(String(128), nullable=True)
+    nom = Column(String(80), nullable=True)
+    prenom = Column(String(80), nullable=True)
+    google_sub = Column(String(128), nullable=True, unique=True, index=True)
+    cgu_version = Column(String(16), nullable=True)
+    cgu_acceptees_le = Column(DateTime(timezone=True), nullable=True)
+    email_verifie_le = Column(DateTime(timezone=True), nullable=True)
+    pin_hash = Column(String(128), nullable=True)
+    jeton_hash = Column(String(64), unique=True, nullable=False, index=True)
+    code_hash = Column(String(64), nullable=True)
+    code_sel = Column(String(32), nullable=True)
+    tentatives = Column(Integer, nullable=True, default=0)
+    nb_envois = Column(Integer, nullable=True, default=0)
+    dernier_envoi_le = Column(DateTime(timezone=True), nullable=True)
+    expire_le = Column(DateTime(timezone=True), nullable=True)
+    flux_expire_le = Column(DateTime(timezone=True), nullable=False)
+    code_valide_le = Column(DateTime(timezone=True), nullable=True)
+    utilise_le = Column(DateTime(timezone=True), nullable=True)
+    fantome = Column(Integer, nullable=True, default=0)
+    ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class NotificationGrind(Base):
     """Notification persistante liée à une mention dans une publication ou un commentaire."""
     __tablename__ = "notifications_grind"

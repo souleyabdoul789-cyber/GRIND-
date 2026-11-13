@@ -12,6 +12,7 @@ Principes (tous appliqués ICI, côté serveur) :
 
 import re
 import secrets
+import hashlib
 import unicodedata
 from datetime import datetime, timedelta, timezone
 
@@ -24,7 +25,7 @@ import verification as vf
 from auth_grind import creer_session, hacher_mot_de_passe, supprimer_session, verifier_mot_de_passe, verifier_session
 from database import get_db
 from limiteur import autoriser, noter_echec, oublier, trop_d_echecs
-from models import CompteGrind, GrindSession, VerificationEmail, GrindDeviceAccount, Profil
+from models import CompteGrind, GrindSession, VerificationEmail, InscriptionEnAttente, GrindDeviceAccount, Profil
 from models_proviseur import ProviseurCandidature
 from moderation import (
     ADMIN_USERNAME, CGU_VERSION, ROLE_ADMIN,
@@ -34,6 +35,7 @@ from scolaire import ErreurValidation, catalogue
 from schemas import (
     AssocierEmail, CompteGrindLogin, CompteGrindSignup, JetonVerification, MotDePasseOublie,
     ReinitialiserMotDePasse, SessionRequest, VerifierCode, GoogleAuthRequest,
+    InscriptionPinRequest, NomProfilInscriptionRequest,
 )
 from validation import (
     email_canonique, masquer_email, valider_email, valider_mot_de_passe, valider_pseudo,
@@ -104,8 +106,8 @@ def _purger_inscriptions_non_verifiees(db: Session):
     perimes = db.query(CompteGrind).filter(CompteGrind.email_verifie == 0, CompteGrind.created_at < limite).all()
     for compte in perimes:
         _supprimer_compte_non_verifie(db, compte)
-    if perimes:
-        db.commit()
+    db.query(InscriptionEnAttente).filter(InscriptionEnAttente.created_at < limite).delete(synchronize_session=False)
+    db.commit()
 
 
 def _supprimer_compte_non_verifie(db: Session, compte: CompteGrind):
@@ -114,11 +116,80 @@ def _supprimer_compte_non_verifie(db: Session, compte: CompteGrind):
     db.delete(compte)
 
 
-def _flux_actif(db: Session, jeton: str) -> VerificationEmail:
-    flux = vf.trouver_flux(db, VerificationEmail, jeton)
+def _flux_actif(db: Session, jeton: str):
+    flux = vf.trouver_flux(db, InscriptionEnAttente, jeton)
+    if flux is None:
+        flux = vf.trouver_flux(db, VerificationEmail, jeton)
     if flux is None or not vf.flux_utilisable(flux, vf.maintenant()):
         _erreur(400, "flux_expire", MESSAGE_FLUX_PERIME)
     return flux
+
+
+def _inscription_active(db: Session, jeton: str, pin_requis: bool = False) -> InscriptionEnAttente:
+    # Verrouille le flux pendant les étapes sensibles : évite qu'un même jeton
+    # finalise deux comptes simultanément sur les bases MySQL de production.
+    flux = db.query(InscriptionEnAttente).filter(
+        InscriptionEnAttente.jeton_hash == vf.empreinte_jeton(jeton)
+    ).with_for_update().first()
+    if flux is None or not vf.flux_utilisable(flux, vf.maintenant()) or flux.fantome:
+        _erreur(400, "inscription_expiree", MESSAGE_FLUX_PERIME)
+    if not flux.email_verifie_le:
+        _erreur(403, "email_non_verifie", "Vérifie d'abord ton adresse e-mail.")
+    if pin_requis and not flux.pin_hash:
+        _erreur(403, "pin_requis", "Configure d'abord ton PIN de sécurité à 4 chiffres.")
+    return flux
+
+
+def _nom_profil_occupe(db: Session, pseudo: str) -> bool:
+    return db.query(CompteGrind).filter(func.lower(CompteGrind.username) == pseudo.lower()).first() is not None
+
+
+def _creer_inscription_en_attente(
+    db: Session, *, email: str, canon: str, password_hash: str,
+    nom: str | None, prenom: str | None, ip: str,
+):
+    """Crée atomiquement le brouillon d'inscription et son code e-mail."""
+    maintenant = vf.maintenant()
+    jeton = secrets.token_urlsafe(32)
+    flux = InscriptionEnAttente(
+        objet="inscription", username=None, email=email, email_canonique=canon,
+        password_hash=password_hash, nom=nom, prenom=prenom,
+        cgu_version=CGU_VERSION, cgu_acceptees_le=maintenant,
+        jeton_hash=vf.empreinte_jeton(jeton), tentatives=0, nb_envois=0,
+        flux_expire_le=maintenant + timedelta(minutes=vf.DUREE_FLUX_MIN),
+        fantome=0, ip=ip[:64],
+    )
+    _, code = vf.preparer_envoi(flux, maintenant)
+    db.add(flux)
+    db.commit()
+    db.refresh(flux)
+    return flux, jeton, code
+
+
+def _suggestions_nom_profil(base: str, db: Session, limite: int = 5) -> list[str]:
+    """Propose des variantes lisibles sans contourner les règles de validation."""
+    texte = unicodedata.normalize("NFKD", base or "").encode("ascii", "ignore").decode("ascii").lower()
+    texte = re.sub(r"[^A-Za-z0-9._-]+", "_", texte)
+    texte = re.sub(r"[._-]{2,}", "_", texte).strip("._-")
+    if not texte or not texte[0].isalnum():
+        texte = "Membre" + texte
+    if texte.isdigit():
+        texte = "Membre" + texte
+    texte = texte[:20].rstrip("._-") or "Membre"
+    candidats = []
+    for suffixe in [*(str(i) for i in range(1, 10)), *(f"_{c}" for c in "abcdefghijklmnopqrstuvwxyz"), *(f"{i:02d}" for i in range(10, 100))]:
+        candidat = (texte[:24 - len(suffixe)].rstrip("._-") + suffixe)
+        try:
+            valider_pseudo(candidat)
+        except ErreurValidation:
+            continue
+        if nom_reserve(candidat) or _nom_profil_occupe(db, candidat):
+            continue
+        if candidat.lower() not in {x.lower() for x in candidats}:
+            candidats.append(candidat)
+        if len(candidats) >= limite:
+            break
+    return candidats
 
 
 # ------------------------------------------------------------------ catalogue scolaire (public)
@@ -137,70 +208,84 @@ async def signup(data: CompteGrindSignup, request: Request, taches: BackgroundTa
         _erreur(429, "trop_de_demandes", "Trop d'inscriptions depuis cette connexion. Réessaie dans une heure.")
     _verifier_mail_configure()
 
+    # Compatibilité ascendante : les anciennes versions peuvent encore envoyer un
+    # username dans le premier formulaire. Le nouveau parcours n'en envoie plus.
+    pseudo_ancien = (data.username or "").strip()
+    if pseudo_ancien:
+        try:
+            pseudo = valider_pseudo(pseudo_ancien)
+            email = valider_email(data.email)
+            valider_mot_de_passe(data.password, pseudo)
+        except ErreurValidation as erreur:
+            _erreur(400, "validation", str(erreur))
+        nom = data.nom.strip() if isinstance(data.nom, str) else None
+        prenom = data.prenom.strip() if isinstance(data.prenom, str) else None
+        if (nom is None) != (prenom is None) or (nom is not None and (not nom or not prenom)):
+            _erreur(400, "identite_incomplete", "Renseigne le nom et le prénom dans deux champs séparés.")
+        if nom is not None and (len(nom) > 80 or len(prenom) > 80):
+            _erreur(400, "identite_trop_longue", "Le nom et le prénom sont limités à 80 caractères chacun.")
+        if nom_reserve(pseudo):
+            _erreur(400, "pseudo_reserve", "Ce nom d'utilisateur est réservé — choisis-en un autre.")
+        if not data.cgu_acceptees:
+            _erreur(400, "cgu", "Tu dois accepter les conditions d'utilisation pour créer un compte.")
+        _purger_inscriptions_non_verifiees(db)
+        if _nom_profil_occupe(db, pseudo):
+            _erreur(400, "pseudo_pris", "Ce nom d'utilisateur est déjà pris.")
+        canon = email_canonique(email)
+        if db.query(CompteGrind).filter(CompteGrind.email_canonique == canon, CompteGrind.email_verifie == 1).first():
+            _, jeton = vf.creer_flux(db, VerificationEmail, "inscription", email, None, ip, fantome=True)
+            taches.add_task(_envoyer_gabarit, email, mailer.gabarit_deja_inscrit)
+            return {"verification_requise": True, "email_masque": masquer_email(email), "jeton_verification": jeton}
+        for ancien in db.query(CompteGrind).filter(CompteGrind.email_canonique == canon, CompteGrind.email_verifie == 0).all():
+            _supprimer_compte_non_verifie(db, ancien)
+        compte = CompteGrind(
+            username=pseudo, password_hash=hacher_mot_de_passe(data.password),
+            gsociety_username="__GRIND_NATIVE__", cgu_version=CGU_VERSION,
+            cgu_acceptees_le=datetime.now(timezone.utc), email=email,
+            email_canonique=canon, email_verifie=0, prenom=prenom, nom=nom, bienvenue_vue=0,
+        )
+        db.add(compte)
+        db.commit()
+        flux, jeton = vf.creer_flux(db, VerificationEmail, "inscription", email, pseudo, ip)
+        _, code = vf.preparer_envoi(flux, vf.maintenant())
+        db.commit()
+        taches.add_task(_envoyer_code, email, code, "inscription")
+        return {"verification_requise": True, "email_masque": masquer_email(email), "jeton_verification": jeton}
+
+    # Nouveau parcours : aucune ligne comptes_grind et aucun username public n'existent
+    # avant que l'adresse soit vérifiée, que le PIN soit configuré et que le pseudo soit choisi.
     try:
-        pseudo = valider_pseudo(data.username)
         email = valider_email(data.email)
-        valider_mot_de_passe(data.password, pseudo)
+        valider_mot_de_passe(data.password)
     except ErreurValidation as erreur:
         _erreur(400, "validation", str(erreur))
-
-    # Nom et prénom sont des champs civils distincts du nom de profil.
-    # strip() retire uniquement les espaces de bord et conserve les espaces internes.
-    nom = data.nom.strip() if isinstance(data.nom, str) else None
-    prenom = data.prenom.strip() if isinstance(data.prenom, str) else None
-    if (nom is None) != (prenom is None):
-        _erreur(400, "identite_incomplete", "Renseigne le nom et le prénom dans deux champs séparés.")
-    if nom is not None and (not nom or not prenom):
-        _erreur(400, "identite_incomplete", "Le nom et le prénom ne peuvent pas être vides.")
-    if nom is not None and (len(nom) > 80 or len(prenom) > 80):
+    nom = data.nom.strip() if isinstance(data.nom, str) else ""
+    prenom = data.prenom.strip() if isinstance(data.prenom, str) else ""
+    if not nom or not prenom:
+        _erreur(400, "identite_incomplete", "Renseigne ton nom et ton prénom dans deux champs séparés.")
+    if len(nom) > 80 or len(prenom) > 80:
         _erreur(400, "identite_trop_longue", "Le nom et le prénom sont limités à 80 caractères chacun.")
-    if nom_reserve(pseudo):
-        _erreur(400, "pseudo_reserve", "Ce nom d'utilisateur est réservé — choisis-en un autre.")
     if not data.cgu_acceptees:
         _erreur(400, "cgu", "Tu dois accepter les conditions d'utilisation pour créer un compte.")
 
     _purger_inscriptions_non_verifiees(db)
-
-    if db.query(CompteGrind).filter(func.lower(CompteGrind.username) == pseudo.lower()).first() is not None:
-        _erreur(400, "pseudo_pris", "Ce nom d'utilisateur est déjà pris.")
-
     canon = email_canonique(email)
-    masque = masquer_email(email)
-
-    # Adresse DÉJÀ liée à un compte vérifié : on ne dit rien au demandeur (même réponse que d'habitude),
-    # et on prévient le propriétaire de l'adresse par e-mail.
     if db.query(CompteGrind).filter(CompteGrind.email_canonique == canon, CompteGrind.email_verifie == 1).first():
-        _, jeton = vf.creer_flux(db, VerificationEmail, "inscription", email, None, ip, fantome=True)
+        _, jeton = vf.creer_flux(db, InscriptionEnAttente, "inscription", email, None, ip, fantome=True)
         taches.add_task(_envoyer_gabarit, email, mailer.gabarit_deja_inscrit)
-        return {"verification_requise": True, "email_masque": masque, "jeton_verification": jeton}
+        return {"verification_requise": True, "email_masque": masquer_email(email), "jeton_verification": jeton}
 
-    # Une inscription non vérifiée qui tient la même adresse ne bloque personne : on la remplace.
     for ancien in db.query(CompteGrind).filter(CompteGrind.email_canonique == canon, CompteGrind.email_verifie == 0).all():
         _supprimer_compte_non_verifie(db, ancien)
+    db.query(InscriptionEnAttente).filter(InscriptionEnAttente.email_canonique == canon).delete(synchronize_session=False)
+    db.commit()
 
-    compte = CompteGrind(
-        username=pseudo,
-        password_hash=hacher_mot_de_passe(data.password),
-        # Valeur sentinelle compatible avec les bases existantes (colonne historique NOT NULL).
-        # Aucune vérification ni dépendance à G-SOCIETY n'est utilisée pour les nouvelles inscriptions.
-        gsociety_username="__GRIND_NATIVE__",
-        cgu_version=CGU_VERSION,
-        cgu_acceptees_le=datetime.now(timezone.utc),
-        email=email,
-        email_canonique=canon,
-        email_verifie=0,
-        prenom=prenom,
-        nom=nom,
-        bienvenue_vue=0,
+    flux, jeton, code = _creer_inscription_en_attente(
+        db, email=email, canon=canon, password_hash=hacher_mot_de_passe(data.password),
+        nom=nom, prenom=prenom, ip=ip,
     )
-    db.add(compte)
-    db.commit()
-
-    flux, jeton = vf.creer_flux(db, VerificationEmail, "inscription", email, pseudo, ip)
-    _, code = vf.preparer_envoi(flux, vf.maintenant())
-    db.commit()
     taches.add_task(_envoyer_code, email, code, "inscription")
-    return {"verification_requise": True, "email_masque": masque, "jeton_verification": jeton}
+    return {"verification_requise": True, "email_masque": masquer_email(email), "jeton_verification": jeton, "inscription_en_attente": True}
 
 
 # ------------------------------------------------------------------ vérification du code
@@ -229,6 +314,20 @@ async def verifier_le_code(data: VerifierCode, request: Request, db: Session = D
         _erreur(400, "code_expire", "Ce code n'est plus valable. Demande-en un nouveau.")
 
     now = vf.maintenant()
+    if isinstance(flux, InscriptionEnAttente):
+        if flux.fantome or not flux.password_hash:
+            _erreur(400, "flux_expire", MESSAGE_FLUX_PERIME)
+        flux.email_verifie_le = now
+        flux.code_valide_le = now
+        db.commit()
+        oublier(f"verif:{ip}")
+        return {
+            "inscription_en_attente": True,
+            "etape": "pin_securite",
+            "jeton_inscription": data.jeton_verification,
+            "email_masque": masquer_email(flux.email),
+        }
+
     if flux.objet == "inscription":
         compte = db.get(CompteGrind, flux.username) if flux.username else None
         if compte is None or flux.fantome:
@@ -254,6 +353,8 @@ async def renvoyer_le_code(data: JetonVerification, request: Request, taches: Ba
     _verifier_mail_configure()
 
     flux = _flux_actif(db, data.jeton_verification)
+    if isinstance(flux, InscriptionEnAttente) and flux.email_verifie_le:
+        _erreur(409, "email_deja_verifie", "Cette adresse est déjà vérifiée. Continue avec la configuration de ton compte.")
     if not flux.email:
         _erreur(400, "email_manquant", "Indique d'abord ton adresse e-mail.")
 
@@ -266,6 +367,104 @@ async def renvoyer_le_code(data: JetonVerification, request: Request, taches: Ba
     if info is not None:  # info = code ; None pour un flux fantôme (rien n'est envoyé)
         taches.add_task(_envoyer_code, flux.email, info, "reinitialisation" if flux.objet == "reinitialisation" else "inscription")
     return {"success": True, "attente_secondes": vf.ATTENTE_RENVOI_S, "email_masque": masquer_email(flux.email)}
+
+
+# ------------------------------------------------------------------ fin de l'inscription : PIN puis nom de profil
+
+@router.post("/api/compte/inscription/pin")
+async def configurer_pin_inscription(data: InscriptionPinRequest, db: Session = Depends(get_db)):
+    flux = _inscription_active(db, data.jeton_inscription)
+    if not autoriser(f"pin-inscription:{flux.id}", 5, 900):
+        _erreur(429, "trop_de_tentatives_pin", "Trop de tentatives de configuration du PIN. Réessaie plus tard.")
+    pin = re.sub(r"\s+", "", data.pin or "")
+    if not re.fullmatch(r"\d{4}", pin):
+        _erreur(400, "pin_format", "Le PIN de sécurité doit contenir exactement 4 chiffres.")
+    if flux.pin_hash:
+        return {"success": True, "deja_configure": True}
+    flux.pin_hash = hacher_mot_de_passe(pin)
+    db.commit()
+    return {"success": True, "etape": "nom_profil"}
+
+
+@router.post("/api/compte/inscription/nom-profil/disponibilite")
+async def verifier_disponibilite_nom_profil(data: NomProfilInscriptionRequest, db: Session = Depends(get_db)):
+    flux = _inscription_active(db, data.jeton_inscription, pin_requis=True)
+    if not autoriser(f"nom-profil-check:{flux.id}", 45, 60):
+        _erreur(429, "trop_de_verifications", "Tu effectues trop de vérifications. Patiente un instant.")
+    brut = (data.username or "").strip()
+    try:
+        pseudo = valider_pseudo(brut).lower()
+    except ErreurValidation as erreur:
+        return {"valide": False, "disponible": False, "message": str(erreur), "suggestions": []}
+    if nom_reserve(pseudo):
+        return {
+            "valide": False, "disponible": False,
+            "message": "Ce nom de profil est réservé. Essaie une autre combinaison.",
+            "suggestions": _suggestions_nom_profil(pseudo, db),
+        }
+    if _nom_profil_occupe(db, pseudo):
+        return {
+            "valide": True, "disponible": False,
+            "message": "Ce nom de profil est déjà pris. Voici quelques variantes disponibles.",
+            "suggestions": _suggestions_nom_profil(pseudo, db),
+        }
+    return {"valide": True, "disponible": True, "message": "Ce nom de profil est disponible.", "suggestions": []}
+
+
+@router.post("/api/compte/inscription/nom-profil/finaliser")
+async def finaliser_nom_profil_inscription(data: NomProfilInscriptionRequest, db: Session = Depends(get_db)):
+    flux = _inscription_active(db, data.jeton_inscription, pin_requis=True)
+    if not autoriser(f"nom-profil-final:{flux.id}", 10, 600):
+        _erreur(429, "trop_de_validations", "Trop de tentatives. Attends quelques minutes avant de réessayer.")
+    try:
+        pseudo = valider_pseudo(data.username).lower()
+    except ErreurValidation as erreur:
+        _erreur(400, "pseudo_invalide", str(erreur))
+    if nom_reserve(pseudo):
+        _erreur(400, "pseudo_reserve", "Ce nom de profil est réservé. Choisis-en un autre.", suggestions=_suggestions_nom_profil(pseudo, db))
+    if _nom_profil_occupe(db, pseudo):
+        _erreur(409, "pseudo_pris", "Ce nom de profil vient d'être pris. Choisis une suggestion.", suggestions=_suggestions_nom_profil(pseudo, db))
+    if db.query(CompteGrind).filter(CompteGrind.email_canonique == flux.email_canonique, CompteGrind.email_verifie == 1).first():
+        _erreur(409, "email_deja_utilise", "Cette adresse e-mail est déjà associée à un compte GRIND.")
+
+    maintenant = datetime.now(timezone.utc)
+    compte = CompteGrind(
+        username=pseudo,
+        password_hash=flux.password_hash,
+        gsociety_username="__GRIND_NATIVE__",
+        cgu_version=flux.cgu_version or CGU_VERSION,
+        cgu_acceptees_le=flux.cgu_acceptees_le or maintenant,
+        email=flux.email,
+        email_canonique=flux.email_canonique,
+        email_verifie=1,
+        email_verifie_le=flux.email_verifie_le or maintenant,
+        prenom=flux.prenom,
+        nom=flux.nom,
+        google_sub=flux.google_sub,
+        pin_hash=flux.pin_hash,
+        pin_echecs=0,
+        pin_bloque_jusqua=None,
+        bienvenue_vue=0,
+    )
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    try:
+        db.add(compte)
+        db.flush()  # la clé publique est réservée avant la création de la session
+        db.add(GrindSession(
+            token_hash=token_hash,
+            username=pseudo,
+            expires_at=maintenant + timedelta(days=30),
+            pin_verifie_le=maintenant,
+        ))
+        flux.utilise_le = maintenant
+        db.commit()
+    except Exception:
+        db.rollback()
+        if _nom_profil_occupe(db, pseudo):
+            _erreur(409, "pseudo_pris", "Ce nom de profil vient d'être pris. Choisis une suggestion.", suggestions=_suggestions_nom_profil(pseudo, db))
+        raise
+    return _payload_session(compte, token, db)
 
 
 # ------------------------------------------------------------------ connexion
@@ -321,7 +520,12 @@ async def login(data: CompteGrindLogin, request: Request, taches: BackgroundTask
         return _payload_session(compte, creer_session(compte.username, db), db)
 
     identifiant = (data.username or "").strip()
-    if "@" in identifiant:
+    if identifiant.startswith("@"):  # autorise la saisie du tag complet @profil
+        pseudo_login = identifiant[1:].strip()
+        compte = db.query(CompteGrind).filter(
+            func.lower(CompteGrind.username) == pseudo_login.lower()
+        ).first()
+    elif "@" in identifiant:
         try:
             canon = email_canonique(valider_email(identifiant))
             compte = db.query(CompteGrind).filter(
@@ -359,41 +563,6 @@ async def login(data: CompteGrindLogin, request: Request, taches: BackgroundTask
     oublier(cle_compte)
     return _payload_session(compte, creer_session(compte.username, db), db)
 
-
-def _nom_profil_google_suggere(prenom: str, nom: str, db: Session) -> str:
-    """Construit un nom public lisible, unique et compatible avec les règles GRIND."""
-    brut = f"{prenom}_{nom}".strip("_") or "Membre_GRIND"
-    ascii_brut = unicodedata.normalize("NFKD", brut).encode("ascii", "ignore").decode("ascii")
-    base = re.sub(r"[^A-Za-z]+", "_", ascii_brut).strip("_")
-    if len(base) < 3:
-        base = (base + "_GRIND")[:24].strip("_")
-    base = base[:24].rstrip("_")
-    if not base or not base[0].isalpha():
-        base = "Membre_" + base
-    base = base[:24].rstrip("_")
-
-    # Les suffixes sont alphabétiques pour conserver les règles de nom de profil.
-    candidats = [base]
-    for suffix in "abcdefghijklmnopqrstuvwxyz":
-        candidats.append(base[: 24 - len(suffix)] + suffix)
-    for candidat in candidats:
-        try:
-            valider_pseudo(candidat)
-        except ErreurValidation:
-            continue
-        if not db.query(CompteGrind).filter(func.lower(CompteGrind.username) == candidat.lower()).first():
-            if not nom_reserve(candidat):
-                return candidat
-    # Repli déterministe en cas de collisions nombreuses.
-    for suffix in range(100):
-        candidat = (base[:20].rstrip("_") + "_" + chr(97 + (suffix // 26) % 26) + chr(97 + suffix % 26))[:24]
-        try:
-            valider_pseudo(candidat)
-        except ErreurValidation:
-            continue
-        if not db.query(CompteGrind).filter(func.lower(CompteGrind.username) == candidat.lower()).first() and not nom_reserve(candidat):
-            return candidat
-    raise HTTPException(status_code=503, detail="Impossible de proposer un nom de profil disponible. Réessaie.")
 
 
 @router.post("/api/compte/google")
@@ -457,13 +626,45 @@ async def connexion_google(data: GoogleAuthRequest, db: Session = Depends(get_db
         else:
             username = (data.username or "").strip()
             if not username:
-                suggere = _nom_profil_google_suggere(prenom_google, nom_google, db)
+                # Premier passage : Google a confirmé l'e-mail. On demande le mot de
+                # passe GRIND et l'acceptation des CGU, mais PAS encore le nom public.
+                if not data.password or not data.cgu_acceptees:
+                    return {
+                        "username_requis": True,  # nom historique de réponse conservé pour les clients précédents
+                        "configuration_requise": True,
+                        "prenom": prenom_google,
+                        "nom": nom_google,
+                    }
+                try:
+                    valider_mot_de_passe(data.password)
+                except ErreurValidation as erreur:
+                    _erreur(400, "validation", str(erreur))
+                db.query(InscriptionEnAttente).filter(
+                    (InscriptionEnAttente.email_canonique == canon) | (InscriptionEnAttente.google_sub == sub)
+                ).delete(synchronize_session=False)
+                maintenant = datetime.now(timezone.utc)
+                jeton = secrets.token_urlsafe(32)
+                flux = InscriptionEnAttente(
+                    objet="inscription", username=None, email=email, email_canonique=canon,
+                    password_hash=hacher_mot_de_passe(data.password),
+                    prenom=prenom_google or None, nom=nom_google or None, google_sub=sub,
+                    cgu_version=CGU_VERSION, cgu_acceptees_le=maintenant,
+                    email_verifie_le=maintenant, pin_hash=None,
+                    jeton_hash=vf.empreinte_jeton(jeton), tentatives=0, nb_envois=0,
+                    flux_expire_le=maintenant + timedelta(minutes=vf.DUREE_FLUX_MIN),
+                    code_valide_le=maintenant, fantome=0,
+                )
+                db.add(flux)
+                db.commit()
                 return {
-                    "username_requis": True,
-                    "suggested_username": suggere,
-                    "prenom": prenom_google,
-                    "nom": nom_google,
+                    "inscription_en_attente": True,
+                    "etape": "pin_securite",
+                    "jeton_inscription": jeton,
+                    "email_masque": masquer_email(email),
                 }
+
+            # Compatibilité ascendante pour les anciennes versions clientes : elles
+            # peuvent encore envoyer un username dès l'inscription Google.
             try:
                 pseudo = valider_pseudo(username)
             except ErreurValidation as erreur:
@@ -471,12 +672,12 @@ async def connexion_google(data: GoogleAuthRequest, db: Session = Depends(get_db
             if nom_reserve(pseudo):
                 _erreur(400, "pseudo_reserve", "Ce nom d'utilisateur est réservé.")
             if not data.cgu_acceptees:
-                _erreur(400, "cgu", "Tu dois accepter les conditions d'utilisation avant de créer ton compte.")
+                _erreur(400, "cgu", "Tu dois accepter les conditions d'utilisation avant de créer un compte.")
             try:
                 valider_mot_de_passe(data.password or "", pseudo)
             except ErreurValidation as erreur:
                 _erreur(400, "validation", str(erreur))
-            if db.query(CompteGrind).filter(func.lower(CompteGrind.username) == pseudo.lower()).first():
+            if _nom_profil_occupe(db, pseudo):
                 _erreur(409, "pseudo_pris", "Ce nom de profil est déjà utilisé.")
             compte = CompteGrind(
                 username=pseudo,

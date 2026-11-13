@@ -6,10 +6,9 @@ from typing import Any, Optional
 
 
 class CompteGrindSignup(BaseModel):
-    # username reste le nom de profil historique et demeure le premier champ du flux.
-    # nom/prenom sont des données civiles indépendantes, non uniques et facultatives
-    # à l'API pour assurer la compatibilité avec les anciennes versions du client.
-    username: str
+    # Nouveau client : username absent jusqu'à la validation du PIN.
+    # Client historique : username reste accepté pour compatibilité ascendante.
+    username: Optional[str] = None
     email: str
     password: str
     cgu_acceptees: bool = False
@@ -324,6 +323,18 @@ class GoogleAuthRequest(BaseModel):
 class PinRequest(BaseModel):
     session_token: str
     pin: str
+
+
+class InscriptionPinRequest(BaseModel):
+    jeton_inscription: str
+    pin: str
+
+
+class NomProfilInscriptionRequest(BaseModel):
+    jeton_inscription: str
+    username: str
+
+
 
 
 class PinResetRequest(BaseModel):
