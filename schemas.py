@@ -6,10 +6,15 @@ from typing import Any, Optional
 
 
 class CompteGrindSignup(BaseModel):
+    # username reste le nom de profil historique et demeure le premier champ du flux.
+    # nom/prenom sont des données civiles indépendantes, non uniques et facultatives
+    # à l'API pour assurer la compatibilité avec les anciennes versions du client.
     username: str
     email: str
     password: str
     cgu_acceptees: bool = False
+    nom: Optional[str] = None
+    prenom: Optional[str] = None
 
 
 class CompteGrindLogin(BaseModel):
@@ -80,8 +85,8 @@ class PostCreate(BaseModel):
     media_items: Optional[list[dict]] = None  # galerie jusqu’à 10 médias
     document_url: Optional[str] = None
     document_name: Optional[str] = None
+    document_title: Optional[str] = None
     document_type: Optional[str] = None
-    document_categorie: Optional[str] = None  # catégorie libre et facultative du document
     etablissement_id: Optional[int] = None
 
 
@@ -312,6 +317,7 @@ class ReinitialiserMotDePasse(BaseModel):
 class GoogleAuthRequest(BaseModel):
     credential: str
     username: Optional[str] = None
+    password: Optional[str] = None
     cgu_acceptees: bool = False
 
 

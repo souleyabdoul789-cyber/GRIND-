@@ -534,6 +534,8 @@ class ClasseDiscussionMessage(Base):
     piece_taille = Column(Integer, nullable=True)
     modifie = Column(Integer, nullable=True, default=0)
     modifie_le = Column(DateTime(timezone=True), nullable=True)
+    # Colonne nullable pour que la migration légère puisse l'ajouter aux bases existantes.
+    supprime_pour_tous = Column(Integer, nullable=True, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 

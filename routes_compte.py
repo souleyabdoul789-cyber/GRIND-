@@ -143,6 +143,17 @@ async def signup(data: CompteGrindSignup, request: Request, taches: BackgroundTa
         valider_mot_de_passe(data.password, pseudo)
     except ErreurValidation as erreur:
         _erreur(400, "validation", str(erreur))
+
+    # Nom et prénom sont des champs civils distincts du nom de profil.
+    # strip() retire uniquement les espaces de bord et conserve les espaces internes.
+    nom = data.nom.strip() if isinstance(data.nom, str) else None
+    prenom = data.prenom.strip() if isinstance(data.prenom, str) else None
+    if (nom is None) != (prenom is None):
+        _erreur(400, "identite_incomplete", "Renseigne le nom et le prénom dans deux champs séparés.")
+    if nom is not None and (not nom or not prenom):
+        _erreur(400, "identite_incomplete", "Le nom et le prénom ne peuvent pas être vides.")
+    if nom is not None and (len(nom) > 80 or len(prenom) > 80):
+        _erreur(400, "identite_trop_longue", "Le nom et le prénom sont limités à 80 caractères chacun.")
     if nom_reserve(pseudo):
         _erreur(400, "pseudo_reserve", "Ce nom d'utilisateur est réservé — choisis-en un autre.")
     if not data.cgu_acceptees:
@@ -178,6 +189,8 @@ async def signup(data: CompteGrindSignup, request: Request, taches: BackgroundTa
         email=email,
         email_canonique=canon,
         email_verifie=0,
+        prenom=prenom,
+        nom=nom,
         bienvenue_vue=0,
     )
     db.add(compte)
@@ -318,7 +331,11 @@ async def login(data: CompteGrindLogin, request: Request, taches: BackgroundTask
         except ErreurValidation:
             compte = None
     else:
-        compte = db.get(CompteGrind, identifiant)
+        # Le login utilise le nom de profil GRIND (jamais le nom/prénom civil).
+        # La comparaison sans casse évite un refus lié aux majuscules saisies.
+        compte = db.query(CompteGrind).filter(
+            func.lower(CompteGrind.username) == identifiant.lower()
+        ).first()
     mot_de_passe_ok = verifier_mot_de_passe(data.password, compte.password_hash if compte else _HASH_FACTICE)
     if compte is None or compte.username == ADMIN_USERNAME or not mot_de_passe_ok:
         noter_echec(ip)
@@ -455,12 +472,15 @@ async def connexion_google(data: GoogleAuthRequest, db: Session = Depends(get_db
                 _erreur(400, "pseudo_reserve", "Ce nom d'utilisateur est réservé.")
             if not data.cgu_acceptees:
                 _erreur(400, "cgu", "Tu dois accepter les conditions d'utilisation avant de créer ton compte.")
+            try:
+                valider_mot_de_passe(data.password or "", pseudo)
+            except ErreurValidation as erreur:
+                _erreur(400, "validation", str(erreur))
             if db.query(CompteGrind).filter(func.lower(CompteGrind.username) == pseudo.lower()).first():
-                _erreur(409, "pseudo_pris", "Ce nom d'utilisateur est déjà utilisé.")
-            mot_de_passe_aleatoire = secrets.token_urlsafe(48)
+                _erreur(409, "pseudo_pris", "Ce nom de profil est déjà utilisé.")
             compte = CompteGrind(
                 username=pseudo,
-                password_hash=hacher_mot_de_passe(mot_de_passe_aleatoire),
+                password_hash=hacher_mot_de_passe(data.password),
                 gsociety_username="__GRIND_NATIVE__",
                 cgu_version=CGU_VERSION,
                 cgu_acceptees_le=datetime.now(timezone.utc),

@@ -68,27 +68,33 @@ def _nom_compte(db: Session, username: str) -> str:
 
 
 def _serialiser_message(db: Session, classe_id: int, message: ClasseDiscussionMessage) -> dict:
-    auteur = db.get(CompteGrind, message.auteur_username)
+    supprime = bool(getattr(message, "supprime_pour_tous", 0))
     parent = db.get(ClasseDiscussionMessage, message.reply_to_id) if message.reply_to_id else None
+    parent_supprime = bool(getattr(parent, "supprime_pour_tous", 0)) if parent else False
+    extrait_parent = (
+        "Message supprimé" if parent_supprime else
+        ((parent.contenu or "")[:180] or ("Message vocal" if parent.piece_type == "audio" else parent.piece_nom or "Pièce jointe"))
+    ) if parent else None
     return {
         "id": message.id,
         "auteur": message.auteur_username,
         "auteur_nom": _nom_compte(db, message.auteur_username),
-        "contenu": message.contenu or "",
+        "contenu": "Ce message a été supprimé." if supprime else (message.contenu or ""),
         "reply_to_id": message.reply_to_id,
         "reply": ({"id": parent.id, "auteur": parent.auteur_username,
                    "auteur_nom": _nom_compte(db, parent.auteur_username),
-                   "contenu": ((parent.contenu or "")[:180] or ("Message vocal" if parent.piece_type == "audio" else parent.piece_nom or "Pièce jointe"))} if parent else None),
+                   "contenu": extrait_parent} if parent else None),
         "style_texte": message.style_texte or "normal",
         # Ne jamais exposer l'URL publique Cloudinary d'une pièce privée.
         # Chaque client construit sa propre URL proxy avec son jeton de session.
         "piece": ({"url": f"/api/classes/{classe_id}/discussion/messages/{message.id}/piece",
                    "type": message.piece_type, "nom": message.piece_nom,
                    "mime": message.piece_mime, "taille": message.piece_taille}
-                  if message.piece_url else None),
+                  if message.piece_url and not supprime else None),
         "created_at": message.created_at.isoformat() if message.created_at else None,
-        "modifie": bool(getattr(message, "modifie", 0)),
+        "modifie": bool(getattr(message, "modifie", 0)) and not supprime,
         "modifie_le": message.modifie_le.isoformat() if getattr(message, "modifie_le", None) else None,
+        "supprime_pour_tous": supprime,
     }
 
 
@@ -473,6 +479,8 @@ async def modifier_message_discussion(classe_id: int, message_id: int, data: dic
     message = db.query(ClasseDiscussionMessage).filter_by(id=message_id, discussion_id=discussion.id).first()
     if message is None:
         raise HTTPException(status_code=404, detail="Message introuvable.")
+    if bool(getattr(message, "supprime_pour_tous", 0)):
+        raise HTTPException(status_code=410, detail="Ce message a déjà été supprimé pour tout le monde.")
     if message.auteur_username != username:
         raise HTTPException(status_code=403, detail="Tu peux uniquement modifier tes propres messages.")
     if message.piece_url:
@@ -508,6 +516,45 @@ async def masquer_message_discussion(classe_id: int, message_id: int, data: dict
         db.add(ClasseDiscussionMessageMasque(message_id=message_id, username=username))
         db.commit()
     return {"success": True, "message_id": message_id, "supprime_pour_moi": True}
+
+
+@router.delete("/api/classes/{classe_id}/discussion/messages/{message_id}/pour-tous")
+async def supprimer_message_discussion_pour_tous(
+    classe_id: int, message_id: int, data: dict, db: Session = Depends(get_db)
+):
+    """Retrait global : auteur ou administrateur/propriétaire du groupe uniquement."""
+    username = _identite(data.get("session_token", ""), db)
+    classe, discussion = _classe_et_discussion(db, classe_id)
+    membre = _membre(db, discussion.id, username)
+    message = db.query(ClasseDiscussionMessage).filter_by(
+        id=message_id, discussion_id=discussion.id
+    ).first()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message introuvable.")
+
+    est_admin_groupe = membre.role in {"owner", "admin"}
+    est_auteur = message.auteur_username == username
+    if not est_auteur and not est_admin_groupe:
+        raise HTTPException(status_code=403, detail="Seul l'auteur ou un administrateur du groupe peut supprimer ce message pour tout le monde.")
+
+    if not bool(getattr(message, "supprime_pour_tous", 0)):
+        # Tombstone conservé pour que tous les membres voient que le message a été retiré.
+        # Les données et références de média sont effacées du message côté serveur.
+        message.contenu = ""
+        message.piece_url = None
+        message.piece_type = None
+        message.piece_nom = None
+        message.piece_mime = None
+        message.piece_taille = None
+        message.supprime_pour_tous = 1
+        db.query(ClasseDiscussionMessageMasque).filter_by(message_id=message_id).delete(synchronize_session=False)
+        db.query(ClasseDiscussionMention).filter_by(message_id=message_id).delete(synchronize_session=False)
+        db.commit()
+        db.refresh(message)
+
+    payload = _serialiser_message(db, classe.id, message)
+    await manager.diffuser_discussion(discussion.id, {"type": "message_deleted", "message": payload})
+    return {"success": True, "message": payload, "supprime_pour_tous": True}
 
 
 @router.get("/api/classes/{classe_id}/discussion/membres")
