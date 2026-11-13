@@ -7,10 +7,11 @@ des personnes qui ne prennent pas de siège dans la classe réelle.
 from datetime import datetime, timedelta, timezone
 import re
 import secrets
+import uuid
 from urllib.parse import urlparse, quote
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -26,10 +27,12 @@ from models import (
 from ws_manager import manager
 from moderation import sanction_active
 from push_notifications import envoyer_notifications_push, envoyer_push_a_utilisateur
+from media import _envoyer_cloudinary, _informations_fichier
 
 router = APIRouter()
 MAX_MESSAGE = 5000
 MAX_PAGE = 60
+MAX_VOCAL_OCTETS = 8 * 1024 * 1024
 
 
 def _identite(session_token: str, db: Session) -> str:
@@ -75,7 +78,7 @@ def _serialiser_message(db: Session, classe_id: int, message: ClasseDiscussionMe
         "reply_to_id": message.reply_to_id,
         "reply": ({"id": parent.id, "auteur": parent.auteur_username,
                    "auteur_nom": _nom_compte(db, parent.auteur_username),
-                   "contenu": (parent.contenu or "")[:180]} if parent else None),
+                   "contenu": ((parent.contenu or "")[:180] or ("Message vocal" if parent.piece_type == "audio" else parent.piece_nom or "Pièce jointe"))} if parent else None),
         "style_texte": message.style_texte or "normal",
         # Ne jamais exposer l'URL publique Cloudinary d'une pièce privée.
         # Chaque client construit sa propre URL proxy avec son jeton de session.
@@ -114,7 +117,7 @@ def _verifier_piece(piece: dict | None):
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
         raise HTTPException(status_code=400, detail="La pièce jointe doit provenir du stockage GRIND.")
-    limites = {"image": ("/image/upload/", 25), "video": ("/video/upload/", 300), "document": ("/raw/upload/", 15)}
+    limites = {"image": ("/image/upload/", 25), "video": ("/video/upload/", 300), "audio": ("/video/upload/", 8), "document": ("/raw/upload/", 15)}
     if genre not in limites:
         raise HTTPException(status_code=400, detail="Type de pièce jointe non accepté.")
     chemin, max_mo = limites[genre]
@@ -125,9 +128,12 @@ def _verifier_piece(piece: dict | None):
         "image": {"jpg", "jpeg", "png", "webp"},
         "video": {"mp4", "mov", "webm"},
         "document": {"pdf", "docx"},
+        "audio": {"webm", "ogg", "m4a", "mp3"},
     }
     if extension not in extensions[genre]:
         raise HTTPException(status_code=415, detail="Extension de pièce jointe non prise en charge.")
+    if genre == "audio" and not mime.startswith("audio/"):
+        raise HTTPException(status_code=415, detail="Le message vocal doit être un fichier audio valide.")
     return {"url": url, "type": genre, "nom": nom, "mime": mime, "taille": taille}
 
 
@@ -250,7 +256,7 @@ async def obtenir_piece_message(
             "X-Content-Type-Options": "nosniff",
             "Content-Disposition": (
                 f"inline; filename*=UTF-8''{quote(message.piece_nom or 'piece-jointe')}"
-                if message.piece_type in ("image", "video")
+                if message.piece_type in ("image", "video", "audio")
                 else f"attachment; filename*=UTF-8''{quote(message.piece_nom or 'document')}"
             ),
         }
@@ -277,6 +283,62 @@ async def obtenir_piece_message(
             await upstream.aclose()
         await client.aclose()
         raise HTTPException(status_code=502, detail="Le stockage de pièce jointe est temporairement indisponible.")
+
+
+@router.post("/api/classes/{classe_id}/discussion/vocaux")
+async def envoyer_vocal_discussion(
+    classe_id: int,
+    session_token: str = Form(...),
+    file: UploadFile = File(...),
+    reply_to_id: int | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Stocke le vocal sur Cloudinary (pas dans SQL), puis publie son message."""
+    username = _identite(session_token, db)
+    classe, discussion = _classe_et_discussion(db, classe_id)
+    membre = _membre(db, discussion.id, username)
+    if _restriction_active(db, membre):
+        raise HTTPException(status_code=403, detail="Tu ne peux pas envoyer de message pour le moment.")
+
+    nom, mime, taille = _informations_fichier(file, "audio", MAX_VOCAL_OCTETS)
+    params = {
+        "folder": "grind_discussion_audio",
+        "public_id": uuid.uuid4().hex,
+        "allowed_formats": "webm,ogg,m4a,mp3",
+    }
+    resultat = await _envoyer_cloudinary(file, nom, mime, "video", params)
+    url = str(resultat.get("secure_url") or "")
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com" or "/video/upload/" not in parsed.path:
+        raise HTTPException(status_code=502, detail="Le stockage n'a pas retourné un fichier vocal exploitable.")
+    piece = _verifier_piece({
+        "url": url, "type": "audio", "nom": nom, "mime": mime, "taille": taille,
+    })
+
+    parent = None
+    if reply_to_id is not None:
+        parent = db.get(ClasseDiscussionMessage, int(reply_to_id))
+        if parent is None or parent.discussion_id != discussion.id:
+            raise HTTPException(status_code=404, detail="Le message auquel tu réponds est introuvable.")
+
+    message = ClasseDiscussionMessage(
+        discussion_id=discussion.id,
+        auteur_username=username,
+        contenu="",
+        reply_to_id=parent.id if parent else None,
+        style_texte="normal",
+        piece_url=piece["url"],
+        piece_type="audio",
+        piece_nom=piece["nom"],
+        piece_mime=piece["mime"],
+        piece_taille=piece["taille"],
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+    payload = _serialiser_message(db, classe.id, message)
+    await manager.diffuser_discussion(discussion.id, {"type": "message", "message": payload})
+    return {"success": True, "message": payload}
 
 
 @router.post("/api/classes/{classe_id}/discussion/messages")

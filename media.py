@@ -55,6 +55,12 @@ DOCUMENTS = {
     ".pdf": ("application/pdf", (b"%PDF-",)),
     ".docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", (b"PK\x03\x04",)),
 }
+AUDIO = {
+    ".webm": ("audio/webm", (b"\x1aE\xdf\xa3",)),
+    ".ogg": ("audio/ogg", (b"OggS",)),
+    ".m4a": ("audio/mp4", (b"ftyp",)),
+    ".mp3": ("audio/mpeg", (b"ID3",)),
+}
 
 
 def _signer(params: dict) -> str:
@@ -76,7 +82,7 @@ def _verifier_compte_upload(session_token: str, db: Session) -> str:
 def _informations_fichier(upload: UploadFile, groupe: str, limite_octets: int):
     nom = Path(upload.filename or "fichier").name
     extension = Path(nom).suffix.lower()
-    catalogue = IMAGES if groupe == "image" else VIDEOS if groupe == "video" else DOCUMENTS
+    catalogue = IMAGES if groupe == "image" else VIDEOS if groupe == "video" else AUDIO if groupe == "audio" else DOCUMENTS
     specification = catalogue.get(extension)
     if specification is None:
         raise HTTPException(status_code=415, detail="Format de fichier non accepté.")
@@ -96,6 +102,8 @@ def _informations_fichier(upload: UploadFile, groupe: str, limite_octets: int):
         signature_ok = len(entete) >= 12 and entete[4:8] == b"ftyp"
     if groupe == "image" and extension == ".webp":
         signature_ok = len(entete) >= 12 and entete[:4] == b"RIFF" and entete[8:12] == b"WEBP"
+    if groupe == "audio" and extension == ".m4a":
+        signature_ok = len(entete) >= 12 and entete[4:8] == b"ftyp"
     if not signature_ok:
         raise HTTPException(status_code=415, detail="Le contenu du fichier ne correspond pas à son extension.")
     mime_declare = (upload.content_type or "").split(";", 1)[0].strip().lower()

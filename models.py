@@ -192,6 +192,7 @@ class Post(Base):
     medias_json = Column(Text, nullable=True)  # galerie de médias (jusqu’à 10), rétrocompatible avec media_url
     document_url = Column(String(512), nullable=True)
     document_name = Column(String(180), nullable=True)
+    document_title = Column(String(180), nullable=True)
     document_type = Column(String(80), nullable=True)
     etablissement_id = Column(Integer, nullable=True, index=True)  # post institutionnel, NULL = fil général
     auteur_type = Column(String(16), nullable=True, default="eleve")
@@ -527,7 +528,7 @@ class ClasseDiscussionMessage(Base):
     reply_to_id = Column(Integer, ForeignKey("classe_discussion_messages.id", ondelete="SET NULL"), nullable=True, index=True)
     style_texte = Column(String(16), nullable=False, default="normal")  # normal / serif / mono
     piece_url = Column(String(900), nullable=True)
-    piece_type = Column(String(16), nullable=True)  # image / video / document
+    piece_type = Column(String(16), nullable=True)  # image / video / document / audio
     piece_nom = Column(String(180), nullable=True)
     piece_mime = Column(String(120), nullable=True)
     piece_taille = Column(Integer, nullable=True)
