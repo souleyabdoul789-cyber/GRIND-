@@ -6,6 +6,7 @@ Aucun secret Cloudinary n'est envoyé au navigateur.
 """
 
 import hashlib
+import io
 import logging
 import math
 import os
@@ -16,6 +17,7 @@ import hmac
 import zipfile
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -120,6 +122,122 @@ def _informations_fichier(upload: UploadFile, groupe: str, limite_octets: int):
         finally:
             upload.file.seek(0)
     return nom[:180], mime, taille
+
+
+async def _telecharger_octets_cloudinary(
+    url: str,
+    limite_octets: int | None = None,
+    prefix_octets: int | None = None,
+) -> bytes:
+    """Lit un asset Cloudinary en suivant uniquement ses redirections HTTPS autorisées.
+
+    Cloudinary peut rediriger res.cloudinary.com vers un hôte CDN de son propre
+    domaine. Un refus systématique des 3xx faisait échouer la confirmation d'un
+    upload pourtant terminé. La destination reste strictement limitée à
+    cloudinary.com et à ses sous-domaines, avec cinq redirections au maximum.
+    """
+    url_initiale = urlparse(url)
+    if url_initiale.scheme != "https" or (url_initiale.hostname or "").lower() != "res.cloudinary.com":
+        raise HTTPException(status_code=400, detail="Adresse de stockage Cloudinary invalide.")
+
+    entetes = {"Accept-Encoding": "identity"}
+    if prefix_octets:
+        entetes["Range"] = f"bytes=0-{prefix_octets - 1}"
+
+    current_url = url
+    redirections = {301, 302, 303, 307, 308}
+    try:
+        timeout = httpx.Timeout(45.0, connect=12.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            for numero in range(6):
+                async with client.stream("GET", current_url, headers=entetes) as response:
+                    if response.status_code in redirections:
+                        location = response.headers.get("location")
+                        if not location or numero == 5:
+                            raise HTTPException(status_code=502, detail="Le stockage n'a pas permis de vérifier le fichier.")
+                        destination = urljoin(current_url, location)
+                        cible = urlparse(destination)
+                        hote = (cible.hostname or "").lower()
+                        hote_autorise = hote == "cloudinary.com" or hote.endswith(".cloudinary.com")
+                        if cible.scheme != "https" or not hote_autorise:
+                            logger.warning("Redirection Cloudinary refusée pendant la validation média: host=%s", hote[:120])
+                            raise HTTPException(status_code=502, detail="Le stockage n'a pas permis de vérifier le fichier.")
+                        current_url = destination
+                        continue
+
+                    if response.status_code not in (200, 206):
+                        logger.warning("Validation Cloudinary impossible: status=%s host=%s", response.status_code, (urlparse(current_url).hostname or "")[:120])
+                        raise HTTPException(status_code=502, detail="Le stockage n'a pas permis de vérifier le fichier.")
+
+                    donnees = bytearray()
+                    async for morceau in response.aiter_bytes():
+                        if prefix_octets:
+                            restant = max(0, prefix_octets - len(donnees))
+                            donnees.extend(morceau[:restant])
+                            if len(donnees) >= prefix_octets:
+                                break
+                        else:
+                            donnees.extend(morceau)
+                        if limite_octets is not None and len(donnees) > limite_octets:
+                            raise HTTPException(status_code=413, detail="Le fichier dépasse la limite autorisée.")
+                    return bytes(donnees)
+
+        raise HTTPException(status_code=502, detail="Le stockage n'a pas permis de vérifier le fichier.")
+    except HTTPException:
+        raise
+    except httpx.HTTPError as erreur:
+        logger.warning("Lecture Cloudinary échouée pendant la validation média: %s", type(erreur).__name__)
+        raise HTTPException(status_code=502, detail="La vérification du fichier stocké a échoué. Réessaie.")
+
+
+async def _verifier_media_stocke(url: str, format_cloudinary: str, groupe: str):
+    """Vérifie le format réel d'une image/vidéo transférée directement à Cloudinary."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
+        raise HTTPException(status_code=400, detail="Adresse de stockage invalide.")
+    prefixe = await _telecharger_octets_cloudinary(url, prefix_octets=1024)
+    fmt = (format_cloudinary or "").lower()
+    if groupe == "image":
+        signatures = {
+            "jpg": prefixe.startswith(b"\xff\xd8\xff"),
+            "jpeg": prefixe.startswith(b"\xff\xd8\xff"),
+            "png": prefixe.startswith(b"\x89PNG\r\n\x1a\n"),
+            "webp": len(prefixe) >= 12 and prefixe[:4] == b"RIFF" and prefixe[8:12] == b"WEBP",
+        }
+    else:
+        signatures = {
+            "mp4": len(prefixe) >= 12 and prefixe[4:8] == b"ftyp",
+            "mov": len(prefixe) >= 12 and prefixe[4:8] == b"ftyp",
+            "webm": prefixe.startswith(b"\x1aE\xdf\xa3"),
+        }
+    if not signatures.get(fmt, False):
+        raise HTTPException(status_code=415, detail="Le contenu du fichier ne correspond pas au format annoncé.")
+
+
+async def _verifier_document_stocke(url: str, nom: str, taille_attendue: int):
+    """Recontrôle la signature binaire et la structure DOCX après upload direct."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    extension = Path(nom).suffix.lower()
+    if (parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com"
+            or not parsed.path.startswith(f"/{CLOUDINARY_CLOUD_NAME}/raw/upload/")
+            or extension not in DOCUMENTS):
+        raise HTTPException(status_code=400, detail="Adresse ou format de document invalide.")
+    contenu = await _telecharger_octets_cloudinary(url, limite_octets=POIDS_MAX_DOCUMENT_MO * 1024 * 1024)
+    if len(contenu) != taille_attendue or taille_attendue <= 0:
+        raise HTTPException(status_code=400, detail="Le document reçu est incomplet.")
+    if extension == ".pdf":
+        valide = contenu.startswith(b"%PDF-")
+    else:
+        try:
+            with zipfile.ZipFile(io.BytesIO(contenu)) as archive:
+                noms = set(archive.namelist())
+            valide = "[Content_Types].xml" in noms and "word/document.xml" in noms
+        except (zipfile.BadZipFile, OSError):
+            valide = False
+    if not valide:
+        raise HTTPException(status_code=415, detail="Le contenu du document ne correspond pas à son extension.")
 
 
 def _donnees_signature_cloudinary(params: dict) -> tuple[int, dict]:
@@ -300,6 +418,8 @@ async def confirmer_upload_media(data: dict, db: Session = Depends(get_db)):
             taille <= 0 or taille > limite_octets):
         raise HTTPException(status_code=400, detail="La réponse du stockage n'a pas pu être vérifiée.")
 
+    await _verifier_media_stocke(secure_url, str(asset.get("format") or ""), "video" if resource_type == "video" else "image")
+
     # Recrée côté serveur l'URL eager prévue et signée à l'origine : le clip
     # publié garde son cadrage et son watermark, sans faire confiance à une URL eager fournie par le navigateur.
     if resource_type == "video":
@@ -338,6 +458,82 @@ async def uploader_media(
     if not url or not url.startswith("https://res.cloudinary.com/"):
         raise HTTPException(status_code=502, detail="Cloudinary n'a pas retourné de média exploitable.")
     return {"media_url": url, "media_type": "video" if groupe == "video" else "image"}
+
+
+@router.post("/api/media/document/signature")
+async def signer_upload_document(data: dict, db: Session = Depends(get_db)):
+    """Signe un transfert documentaire direct ; le contenu sera relu et validé côté serveur."""
+    _verifier_compte_upload(data.get("session_token", ""), db)
+    if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
+        raise HTTPException(status_code=503, detail="Le stockage Cloudinary n'est pas configuré côté serveur.")
+    nom = Path(str(data.get("file_name") or "document")).name[:180]
+    extension = Path(nom).suffix.lower()
+    if extension not in DOCUMENTS:
+        raise HTTPException(status_code=415, detail="Seuls les documents PDF et DOCX sont acceptés.")
+    try:
+        taille = int(data.get("file_size") or 0)
+    except (TypeError, ValueError):
+        taille = 0
+    if taille <= 0 or taille > POIDS_MAX_DOCUMENT_MO * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Le document doit être non vide et ne pas dépasser 15 Mo.")
+    mime_attendu = DOCUMENTS[extension][0]
+    mime_declare = str(data.get("content_type") or "").split(";", 1)[0].strip().lower()
+    if mime_declare and mime_declare not in (mime_attendu, "application/octet-stream"):
+        raise HTTPException(status_code=415, detail="Le type MIME ne correspond pas au document.")
+
+    params = {
+        "folder": "grind_documents",
+        # Les fichiers raw conservent leur extension dans le public_id Cloudinary.
+        "public_id": f"document-{uuid.uuid4().hex}{extension}",
+    }
+    _, donnees = _donnees_signature_cloudinary(params)
+    return {
+        "upload_url": f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/raw/upload",
+        "resource_type": "raw",
+        "api_key": CLOUDINARY_API_KEY,
+        "timestamp": donnees["timestamp"],
+        "signature": donnees["signature"],
+        "params": {k: str(v) for k, v in params.items()},
+    }
+
+
+@router.post("/api/media/document/confirm")
+async def confirmer_upload_document(data: dict, db: Session = Depends(get_db)):
+    _verifier_compte_upload(data.get("session_token", ""), db)
+    if not CLOUDINARY_API_SECRET:
+        raise HTTPException(status_code=503, detail="La validation du stockage n'est pas configurée.")
+    asset = data.get("asset") or {}
+    public_id = str(asset.get("public_id") or "")
+    version = str(asset.get("version") or "")
+    signature = str(asset.get("signature") or "")
+    secure_url = str(asset.get("secure_url") or "")
+    resource_type = str(asset.get("resource_type") or "")
+    try:
+        taille = int(asset.get("bytes") or 0)
+    except (TypeError, ValueError):
+        taille = 0
+    nom = Path(str(data.get("file_name") or "document")).name[:180]
+    extension = Path(nom).suffix.lower()
+    attendu = hashlib.sha1(f"public_id={public_id}&version={version}{CLOUDINARY_API_SECRET}".encode()).hexdigest()
+    from urllib.parse import urlparse
+    parsed = urlparse(secure_url)
+    cloud_path = f"/{CLOUDINARY_CLOUD_NAME}/raw/upload/"
+    if (not public_id.startswith("grind_documents/document-")
+            or Path(public_id).suffix.lower() != extension
+            or extension not in DOCUMENTS
+            or not version.isdigit()
+            or not hmac.compare_digest(signature, attendu)
+            or resource_type != "raw"
+            or parsed.scheme != "https"
+            or parsed.hostname != "res.cloudinary.com"
+            or not parsed.path.startswith(cloud_path)
+            or taille <= 0
+            or taille > POIDS_MAX_DOCUMENT_MO * 1024 * 1024):
+        raise HTTPException(status_code=400, detail="La réponse du stockage n'a pas pu être vérifiée.")
+
+    # La pièce n'est publiée qu'après un contrôle binaire côté serveur.
+    await _verifier_document_stocke(secure_url, nom, taille)
+    return {"document_url": secure_url, "document_name": nom, "document_type": DOCUMENTS[extension][0]}
 
 
 @router.post("/api/media/document")
