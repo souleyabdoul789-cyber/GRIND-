@@ -17,6 +17,7 @@ from models_proviseur import ProviseurCandidature, ProviseurAutorisation, Etabli
 from models import (Profil, Classe, ClasseMembre, CompteGrind, ClasseDiscussion,
                     ClasseDiscussionMembre, ClasseDiscussionMessage, ClasseDiscussionMention, NotificationGrind,
                     ClasseFeuille, ClasseFeuillePermission, ClasseTableau)
+from classe_salle_etendue import ClasseTableauDelegation
 from discussion_service import assurer_discussion
 from ws_manager import manager
 from push_notifications import envoyer_push_a_utilisateur
@@ -426,6 +427,14 @@ async def transferer_prof(classe_id: int, data: ClasseTransfererProf, db: Sessio
         ancien.siege_index = ancien_siege
     nouveau.role = "prof"
     nouveau.siege_index = None
+    # Toute ancienne délégation temporaire appartient au professeur sortant.
+    # Elle est révoquée dans la même transaction que le transfert permanent.
+    delegation = db.query(ClasseTableauDelegation).filter_by(
+        classe_id=classe_id
+    ).with_for_update().first()
+    eleve_revoque = delegation.eleve_username if delegation is not None else None
+    if delegation is not None:
+        db.delete(delegation)
     # Le propriétaire de la classe ne change jamais lors d'un transfert pédagogique.
     classe.prof_username = data.nouveau_prof
     db.commit()
@@ -439,6 +448,12 @@ async def transferer_prof(classe_id: int, data: ClasseTransfererProf, db: Sessio
     await manager.envoyer_session(-classe_id, data.nouveau_prof, {
         "type": "reponse-devenir-prof", "sender": username, "accepte": True, **transfert,
     })
+    if eleve_revoque:
+        await manager.relay(-classe_id, username, {
+            "type": "tableau-delegation-terminee",
+            "raison": "transfert_professeur",
+            "eleve_username": eleve_revoque,
+        })
     await manager.relay(-classe_id, username, {"type": "prof-change", **transfert})
 
     return {"success": True, **transfert}

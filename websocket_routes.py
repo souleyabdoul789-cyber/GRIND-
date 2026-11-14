@@ -6,9 +6,15 @@ feuille/tableau côté serveur avant toute diffusion.
 """
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from datetime import datetime, timedelta
 from database import SessionLocal
 from auth_grind import verifier_session
 from ws_manager import manager
+from classe_salle_etendue import (
+    ClasseFeuilleVersion, ClasseTableauVersion, ClasseTableauDelegation,
+    duree_tableau_securisee, delegation_tableau_active, utc_naive,
+    eleve_connecte_dans_salle, raison_fin_delegation,
+)
 from models import (
     Classe, ClasseMembre, ClasseFeuille, ClasseFeuillePermission, ClasseTableau,
     ClasseDiscussionMembre,
@@ -120,6 +126,21 @@ async def ws_session(
                         feuille = ClasseFeuille(classe_id=demande_id, username=username, contenu=contenu)
                         db.add(feuille)
                     else:
+                        precedent = feuille.contenu or ""
+                        if precedent.strip() and precedent != contenu:
+                            derniere_version = db.query(ClasseFeuilleVersion).filter_by(
+                                classe_id=demande_id, username=username
+                            ).order_by(ClasseFeuilleVersion.id.desc()).first()
+                            instant_precedent = utc_naive(derniere_version.created_at) if derniere_version and derniere_version.created_at else None
+                            if (derniere_version is None or
+                                    (derniere_version.contenu != precedent and
+                                     (not contenu.strip() or instant_precedent is None or utc_naive() - instant_precedent >= timedelta(seconds=30)))):
+                                db.add(ClasseFeuilleVersion(classe_id=demande_id, username=username, contenu=precedent))
+                                db.flush()
+                                for ancienne in db.query(ClasseFeuilleVersion).filter_by(
+                                    classe_id=demande_id, username=username
+                                ).order_by(ClasseFeuilleVersion.id.desc()).offset(100).all():
+                                    db.delete(ancienne)
                         feuille.contenu = contenu
                     db.commit()
                     autorises = db.query(ClasseFeuillePermission.lecteur_username).filter_by(
@@ -178,9 +199,136 @@ async def ws_session(
                         "type": "feuille-acces-revoque", "sender": username,
                     })
 
-                elif type_ == "blackboard-update":
+                elif type_ == "tableau-inviter":
+                    # Verrouille la classe pour sérialiser deux invitations simultanées
+                    # (par exemple deux onglets ouverts par le professeur).
+                    classe_verrouillee = db.query(Classe).filter_by(id=demande_id).with_for_update().first()
+                    if classe_verrouillee is None:
+                        await websocket.send_json({"type": "error", "message": "Classe introuvable."})
+                        continue
+                    professeur = classe_verrouillee.prof_username or classe_verrouillee.createur_username
                     if username != professeur:
-                        await websocket.send_json({"type": "error", "message": "Seul le professeur actuel peut écrire au tableau."})
+                        await websocket.send_json({"type": "error", "message": "Seul le professeur actuel peut inviter un élève au tableau."})
+                        continue
+                    cible = str(msg.get("cible") or "")
+                    cible_ok = db.query(ClasseMembre).filter_by(classe_id=demande_id, username=cible).first()
+                    socket_cible = eleve_connecte_dans_salle(manager.session_connections, canal_id, cible)
+                    if not cible or cible == professeur or cible_ok is None or not socket_cible:
+                        await websocket.send_json({"type": "error", "message": "Cet élève n'est pas présent dans la salle."})
+                        continue
+                    maintenant = utc_naive()
+                    delegation = db.get(ClasseTableauDelegation, demande_id)
+                    if delegation is not None:
+                        expiration = delegation.invitation_expire_at if delegation.statut == "invite" else delegation.expire_at
+                        expiration = utc_naive(expiration) if expiration else None
+                        # Un transfert permanent de professeur rend automatiquement
+                        # caduque toute ancienne délégation, même non expirée.
+                        if delegation.prof_username == professeur and expiration is not None and expiration > maintenant:
+                            await websocket.send_json({"type": "error", "message": "Une invitation ou une prise de main est déjà en cours."})
+                            continue
+                        db.delete(delegation)
+                        db.flush()
+                    duree = duree_tableau_securisee(msg.get("duree_secondes", 180))
+                    delegation = ClasseTableauDelegation(
+                        classe_id=demande_id,
+                        eleve_username=cible,
+                        prof_username=professeur,
+                        statut="invite",
+                        duree_secondes=duree,
+                        invitation_expire_at=maintenant + timedelta(seconds=60),
+                        expire_at=None,
+                    )
+                    db.add(delegation)
+                    db.commit()
+                    await manager.envoyer_session(canal_id, cible, {
+                        "type": "tableau-invitation", "sender": username,
+                        "duree_secondes": duree,
+                        "invitation_expire_at": delegation.invitation_expire_at.isoformat(),
+                    })
+                    pending_payload = {
+                        "eleve_username": cible, "statut": "invite", "duree_secondes": duree,
+                        "invitation_expire_at": delegation.invitation_expire_at.isoformat(),
+                    }
+                    await manager.relay(canal_id, username, {
+                        "type": "tableau-delegation", "delegation": pending_payload,
+                    })
+                    await websocket.send_json({"type": "tableau-delegation", "delegation": pending_payload})
+
+                elif type_ == "tableau-invitation-reponse":
+                    delegation = db.query(ClasseTableauDelegation).filter_by(
+                        classe_id=demande_id
+                    ).with_for_update().first()
+                    expiration = utc_naive(delegation.invitation_expire_at) if delegation and delegation.invitation_expire_at else None
+                    professeur_connecte = eleve_connecte_dans_salle(
+                        manager.session_connections, canal_id, professeur
+                    )
+                    if (delegation is None or delegation.eleve_username != username
+                            or delegation.statut != "invite" or delegation.prof_username != professeur
+                            or expiration is None or expiration <= utc_naive() or not professeur_connecte):
+                        await websocket.send_json({"type": "error", "message": "Cette invitation au tableau a expiré ou n'est plus valable."})
+                        continue
+                    if not bool(msg.get("accepte")):
+                        db.delete(delegation)
+                        db.commit()
+                        await manager.relay(canal_id, username, {"type": "tableau-delegation-terminee", "raison": "refusee", "eleve_username": username})
+                        await manager.envoyer_session(canal_id, professeur, {"type": "tableau-invitation-terminee", "eleve_username": username, "accepte": False})
+                        continue
+                    delegation.statut = "actif"
+                    delegation.expire_at = utc_naive() + timedelta(seconds=duree_tableau_securisee(delegation.duree_secondes))
+                    delegation.invitation_expire_at = None
+                    db.commit()
+                    payload = {
+                        "eleve_username": username,
+                        "prof_username": professeur,
+                        "statut": "actif",
+                        "duree_secondes": int(delegation.duree_secondes or 180),
+                        "expire_at": delegation.expire_at.isoformat() if delegation.expire_at else None,
+                    }
+                    await manager.relay(canal_id, username, {"type": "tableau-delegation-active", "delegation": payload})
+                    await websocket.send_json({"type": "tableau-delegation-active", "delegation": payload})
+
+                elif type_ == "tableau-reprendre":
+                    if username != professeur:
+                        await websocket.send_json({"type": "error", "message": "Seul le professeur actuel peut reprendre le tableau."})
+                        continue
+                    delegation = db.query(ClasseTableauDelegation).filter_by(
+                        classe_id=demande_id
+                    ).with_for_update().first()
+                    ancien_eleve = delegation.eleve_username if delegation else None
+                    if delegation is not None:
+                        db.delete(delegation)
+                        db.commit()
+                    termine_payload = {
+                        "type": "tableau-delegation-terminee", "raison": "reprise_professeur",
+                        "eleve_username": ancien_eleve,
+                    }
+                    await manager.relay(canal_id, username, termine_payload)
+                    await websocket.send_json(termine_payload)
+
+                elif type_ == "blackboard-update":
+                    delegation = db.query(ClasseTableauDelegation).filter_by(
+                        classe_id=demande_id
+                    ).with_for_update().first()
+                    professeur_connecte = eleve_connecte_dans_salle(
+                        manager.session_connections, canal_id, professeur
+                    )
+                    autorise_eleve = (
+                        delegation_tableau_active(delegation, username, professeur)
+                        and professeur_connecte
+                    )
+                    if username != professeur and not autorise_eleve:
+                        if delegation is not None and delegation.statut == "actif":
+                            expiration = utc_naive(delegation.expire_at) if delegation.expire_at else None
+                            if expiration is None or expiration <= utc_naive() or delegation.prof_username != professeur:
+                                db.delete(delegation)
+                                db.commit()
+                                fin_payload = {
+                                    "type": "tableau-delegation-terminee", "raison": "expiree",
+                                    "eleve_username": delegation.eleve_username,
+                                }
+                                await manager.relay(canal_id, username, fin_payload)
+                                await manager.envoyer_session(canal_id, professeur, fin_payload)
+                        await websocket.send_json({"type": "error", "message": "Tu n'as pas la main au tableau. Seul le professeur ou l'élève invité peut écrire."})
                         continue
                     contenu = str(msg.get("contenu") or "")
                     if len(contenu) > 3000:
@@ -191,11 +339,41 @@ async def ws_session(
                         tableau = ClasseTableau(classe_id=demande_id, contenu=contenu, updated_by=username)
                         db.add(tableau)
                     else:
+                        precedent = tableau.contenu or ""
+                        if precedent.strip() and precedent != contenu:
+                            derniere_version = db.query(ClasseTableauVersion).filter_by(
+                                classe_id=demande_id
+                            ).order_by(ClasseTableauVersion.id.desc()).first()
+                            instant_precedent = utc_naive(derniere_version.created_at) if derniere_version and derniere_version.created_at else None
+                            if (derniere_version is None or
+                                    (derniere_version.contenu != precedent and
+                                     (not contenu.strip() or instant_precedent is None or utc_naive() - instant_precedent >= timedelta(seconds=30)))):
+                                db.add(ClasseTableauVersion(
+                                    classe_id=demande_id,
+                                    auteur_username=tableau.updated_by or professeur,
+                                    contenu=precedent,
+                                ))
+                                db.flush()
+                                for ancienne in db.query(ClasseTableauVersion).filter_by(
+                                    classe_id=demande_id
+                                ).order_by(ClasseTableauVersion.id.desc()).offset(150).all():
+                                    db.delete(ancienne)
                         tableau.contenu = contenu
                         tableau.updated_by = username
+                    delegation_terminee = None
+                    if username == professeur and delegation is not None:
+                        delegation_terminee = delegation.eleve_username
+                        db.delete(delegation)
                     db.commit()
+                    if delegation_terminee:
+                        await manager.relay(canal_id, username, {
+                            "type": "tableau-delegation-terminee",
+                            "raison": "reprise_professeur",
+                            "eleve_username": delegation_terminee,
+                        })
                     await manager.relay(canal_id, username, {
                         "type": "blackboard-update", "contenu": contenu,
+                        "auteur": username,
                     })
 
                 elif type_ == "demande-devenir-prof":
@@ -237,6 +415,68 @@ async def ws_session(
 
     except WebSocketDisconnect:
         manager.disconnect_session(canal_id, username)
+        # Un départ capture les derniers contenus confirmés côté serveur, même
+        # si le délai de pause côté navigateur n'a pas encore expiré.
+        # La déconnexion du professeur révoque également la main temporaire.
+        if classe:
+            db_fin = SessionLocal()
+            delegation_fin_payload = None
+            try:
+                classe_fin = db_fin.get(Classe, demande_id)
+                if classe_fin is not None:
+                    feuille_fin = db_fin.query(ClasseFeuille).filter_by(
+                        classe_id=demande_id, username=username
+                    ).first()
+                    if feuille_fin is not None and (feuille_fin.contenu or "").strip():
+                        derniere_feuille = db_fin.query(ClasseFeuilleVersion).filter_by(
+                            classe_id=demande_id, username=username
+                        ).order_by(ClasseFeuilleVersion.id.desc()).first()
+                        if derniere_feuille is None or derniere_feuille.contenu != feuille_fin.contenu:
+                            db_fin.add(ClasseFeuilleVersion(
+                                classe_id=demande_id, username=username, contenu=feuille_fin.contenu
+                            ))
+                            db_fin.flush()
+                            for ancienne in db_fin.query(ClasseFeuilleVersion).filter_by(
+                                classe_id=demande_id, username=username
+                            ).order_by(ClasseFeuilleVersion.id.desc()).offset(100).all():
+                                db_fin.delete(ancienne)
+
+                    tableau_fin = db_fin.get(ClasseTableau, demande_id)
+                    if tableau_fin is not None and (tableau_fin.contenu or "").strip():
+                        derniere_tableau = db_fin.query(ClasseTableauVersion).filter_by(
+                            classe_id=demande_id
+                        ).order_by(ClasseTableauVersion.id.desc()).first()
+                        if derniere_tableau is None or derniere_tableau.contenu != tableau_fin.contenu:
+                            db_fin.add(ClasseTableauVersion(
+                                classe_id=demande_id,
+                                auteur_username=tableau_fin.updated_by or (classe_fin.prof_username or classe_fin.createur_username),
+                                contenu=tableau_fin.contenu,
+                            ))
+                            db_fin.flush()
+                            for ancienne in db_fin.query(ClasseTableauVersion).filter_by(
+                                classe_id=demande_id
+                            ).order_by(ClasseTableauVersion.id.desc()).offset(150).all():
+                                db_fin.delete(ancienne)
+
+                    prof_fin = classe_fin.prof_username or classe_fin.createur_username
+                    delegation_fin = db_fin.query(ClasseTableauDelegation).filter_by(
+                        classe_id=demande_id
+                    ).with_for_update().first()
+                    raison_fin = raison_fin_delegation(delegation_fin, username, prof_fin)
+                    if raison_fin:
+                        delegation_fin_payload = {
+                            "type": "tableau-delegation-terminee",
+                            "raison": raison_fin,
+                            "eleve_username": delegation_fin.eleve_username,
+                        }
+                        db_fin.delete(delegation_fin)
+                    db_fin.commit()
+            except Exception:
+                db_fin.rollback()
+            finally:
+                db_fin.close()
+            if delegation_fin_payload:
+                await manager.relay(canal_id, username, delegation_fin_payload)
         await manager.notifier_depart(canal_id, username)
 
 
@@ -254,7 +494,7 @@ async def ws_discussion(websocket: WebSocket, discussion_id: int, session_token:
         if restreint and jusqua is not None:
             from datetime import datetime
             fin = jusqua.replace(tzinfo=None) if jusqua.tzinfo else jusqua
-            if fin <= datetime.utcnow():
+            if fin <= utc_naive():
                 membre.restreint = 0
                 membre.restriction_jusqua = None
                 db.commit()
