@@ -161,7 +161,24 @@ async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
     username = _identite(data.session_token, db)
 
     try:
-        valide = valider_classe(data.niveau or "", data.matiere or "", data.complement)
+        # Nouveau client : le nom seul suffit. Les colonnes scolaires historiques
+        # sont nullable dans le modèle Classe ; aucun changement SQL n'est requis.
+        if data.nom is not None:
+            # Si le nouveau client a envoyé le champ nom, il doit être valide :
+            # un nom vide ne retombe jamais silencieusement sur l'ancien catalogue.
+            nom_libre = valider_texte_scolaire(
+                data.nom, min_len=2, max_len=128, nom="Le nom de la classe", facultatif=False
+            )
+            valide = {
+                "nom": nom_libre,
+                "niveau": None,
+                "matiere": None,
+                "complement": None,
+            }
+        else:
+            # Compatibilité ascendante : les anciennes versions qui envoient
+            # niveau/matière/complément continuent à créer leurs classes.
+            valide = valider_classe(data.niveau or "", data.matiere or "", data.complement)
     except ErreurValidation as erreur:
         raise HTTPException(status_code=400, detail=str(erreur))
 
@@ -330,7 +347,9 @@ async def renommer_classe(classe_id: int, data: ClasseRenommer, db: Session = De
             nouveau_nom = composer_nom_classe(classe.matiere, classe.niveau, complement)
         else:
             complement = None
-            nouveau_nom = valider_texte_libre(data.nom, min_len=3, max_len=60, nom="Le nom de la classe")
+            nouveau_nom = valider_texte_scolaire(
+                data.nom, min_len=2, max_len=128, nom="Le nom de la classe", facultatif=False
+            )
     except ErreurValidation as erreur:
         raise HTTPException(status_code=400, detail=str(erreur))
 

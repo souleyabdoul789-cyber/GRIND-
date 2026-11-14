@@ -43,9 +43,12 @@ class ProfilCreate(BaseModel):
 
 class ClasseCreate(BaseModel):
     session_token: str
-    niveau: Optional[str] = None  # catalogue scolaire (obligatoire côté serveur)
+    # Nouveau contrat : une classe GRIND est nommée librement, comme un groupe.
+    # Les anciens champs restent acceptés pour les clients déjà installés.
+    nom: Optional[str] = None
+    niveau: Optional[str] = None
     matiere: Optional[str] = None
-    complement: Optional[str] = None  # partie libre du nom, facultative
+    complement: Optional[str] = None
 
 
 class ClasseRejoindre(BaseModel):

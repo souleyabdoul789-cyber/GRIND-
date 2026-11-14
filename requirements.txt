@@ -13,3 +13,4 @@ python-multipart
 google-auth[requests]>=2.29,<3
 
 geoip2
+cloudinary>=1.47,<2

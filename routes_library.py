@@ -1,10 +1,11 @@
 """Bibliothèque publique GRIND : playlists scolaires, documents, votes et avis."""
 from pathlib import Path
 import zipfile
+import logging
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
-from urllib.parse import urlparse
+from fastapi.responses import Response, StreamingResponse
+from urllib.parse import urlparse, urljoin, quote
 import httpx
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -15,9 +16,11 @@ from models import (LibraryPlaylist, LibraryDocument, LibraryDocumentVote,
                     LibraryDocumentComment, NotificationGrind, CompteGrind)
 from library_service import obtenir_playlist_globale
 from media import _envoyer_cloudinary
+from cloudinary_delivery import url_privee_telechargement_raw
 from push_notifications import envoyer_notifications_push
 
 router = APIRouter()
+logger = logging.getLogger("grind.library.delivery")
 
 from library_catalog import CATEGORIES
 
@@ -276,9 +279,82 @@ async def obtenir_document_library(document_id: int, session_token: str, db: Ses
         raise HTTPException(status_code=404, detail="Document introuvable.")
     return {"document": _doc_payload(db, doc, username), "playlist": {"id": playlist.id, "titre": playlist.titre, "categorie": playlist.categorie, "description": playlist.description}}
 
-@router.get("/api/library/documents/{document_id}/preview")
-async def previsualiser_document_library(document_id: int, session_token: str, db: Session = Depends(get_db)):
-    """Proxy authentifié du fichier public pour une prévisualisation sans dépendre du CORS Cloudinary."""
+async def _ouvrir_document_stockage(doc: LibraryDocument):
+    """Ouvre un document depuis Cloudinary, avec fallback signé uniquement sur HTTP 401."""
+    parsed = urlparse(doc.fichier_url or "")
+    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
+        raise HTTPException(status_code=502, detail="La source du document n'est pas reconnue.")
+
+    extension = Path(doc.fichier_nom or "").suffix.lower().lstrip(".")
+    if extension not in {"pdf", "docx", "xlsx", "xls", "csv"}:
+        raise HTTPException(status_code=415, detail="Ce format de document n'est pas pris en charge.")
+
+    client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0), follow_redirects=False)
+    urls = [doc.fichier_url]
+    upstream = None
+    try:
+        for tentative in range(2):
+            if tentative == 1:
+                # private_download_url est un endpoint API non mis en cache CDN ;
+                # on l'utilise pour une livraison ponctuelle, jamais comme URL d'aperçu exposée.
+                signee = url_privee_telechargement_raw(doc.fichier_url, {"pdf", "docx", "xlsx", "xls", "csv"})
+                if not signee:
+                    break
+                urls.append(signee)
+
+            current_url = urls[-1]
+            for numero in range(5):
+                upstream = await client.send(
+                    client.build_request("GET", current_url, headers={"Accept-Encoding": "identity", "Accept": "application/octet-stream"}),
+                    stream=True,
+                )
+                if upstream.status_code not in (301, 302, 303, 307, 308):
+                    break
+                location = upstream.headers.get("location")
+                await upstream.aclose()
+                upstream = None
+                if not location or numero == 4:
+                    break
+                destination = urljoin(current_url, location)
+                cible = urlparse(destination)
+                host = (cible.hostname or "").lower()
+                autorise = host == "cloudinary.com" or host.endswith(".cloudinary.com")
+                if cible.scheme != "https" or not autorise:
+                    logger.warning("Redirection de document refusée: document=%s host=%s", doc.id, host[:120])
+                    break
+                current_url = destination
+
+            if upstream is not None and upstream.status_code == 200:
+                return client, upstream
+
+            status = upstream.status_code if upstream is not None else 0
+            cld_error = (upstream.headers.get("x-cld-error") or "")[:240] if upstream is not None else ""
+            logger.warning("Livraison Cloudinary refusée: document=%s status=%s erreur=%s tentative=%s", doc.id, status, cld_error, tentative + 1)
+            if upstream is not None:
+                await upstream.aclose()
+                upstream = None
+            if tentative == 0 and status == 401:
+                continue
+            break
+
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Cloudinary refuse actuellement la livraison de ce document. Vérifie les règles d'accès aux fichiers raw dans le compte de stockage.")
+    except HTTPException:
+        if upstream is not None:
+            await upstream.aclose()
+        await client.aclose()
+        raise
+    except httpx.HTTPError as erreur:
+        logger.warning("Erreur HTTP de livraison bibliothèque document=%s type=%s", doc.id, type(erreur).__name__)
+        if upstream is not None:
+            await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Impossible de récupérer ce document depuis le stockage.")
+
+
+@router.get("/api/library/documents/{document_id}/download")
+async def telecharger_document_library(document_id: int, session_token: str, db: Session = Depends(get_db)):
+    """Téléchargement authentifié relayé par GRIND, jamais par l'URL Cloudinary brute."""
     _user(session_token, db)
     doc = db.get(LibraryDocument, document_id)
     if not doc:
@@ -286,30 +362,61 @@ async def previsualiser_document_library(document_id: int, session_token: str, d
     playlist = db.get(LibraryPlaylist, doc.playlist_id)
     if not playlist or not playlist.public:
         raise HTTPException(status_code=404, detail="Document introuvable.")
-    url = urlparse(doc.fichier_url or "")
-    if url.scheme != "https" or url.hostname != "res.cloudinary.com":
-        raise HTTPException(status_code=502, detail="La source du document n'est pas reconnue.")
+
+    client, upstream = await _ouvrir_document_stockage(doc)
+    nom = Path(doc.fichier_nom or "document").name[:180]
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(nom, safe='')}",
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if upstream.headers.get("content-length"):
+        headers["Content-Length"] = upstream.headers["content-length"]
+
+    async def flux():
+        try:
+            async for morceau in upstream.aiter_raw():
+                yield morceau
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(flux(), media_type=doc.fichier_type or "application/octet-stream", headers=headers)
+
+
+@router.get("/api/library/documents/{document_id}/preview")
+async def previsualiser_document_library(document_id: int, session_token: str, db: Session = Depends(get_db)):
+    """Aperçu authentifié : même livraison sécurisée que le téléchargement, sans URL Cloudinary côté client."""
+    _user(session_token, db)
+    doc = db.get(LibraryDocument, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document introuvable.")
+    playlist = db.get(LibraryPlaylist, doc.playlist_id)
+    if not playlist or not playlist.public:
+        raise HTTPException(status_code=404, detail="Document introuvable.")
+
+    client, upstream = await _ouvrir_document_stockage(doc)
     contenu = bytearray()
     limite_octets = 30 * 1024 * 1024
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0), follow_redirects=False) as client:
-            async with client.stream("GET", doc.fichier_url) as upstream:
-                if upstream.status_code != 200:
-                    raise HTTPException(status_code=502, detail="Le document n'est pas disponible pour l'aperçu.")
-                longueur = upstream.headers.get("content-length")
-                if longueur and longueur.isdigit() and int(longueur) > limite_octets:
-                    raise HTTPException(status_code=413, detail="Ce document dépasse la taille autorisée pour l'aperçu.")
-                async for morceau in upstream.aiter_bytes():
-                    contenu.extend(morceau)
-                    if len(contenu) > limite_octets:
-                        raise HTTPException(status_code=413, detail="Ce document dépasse la taille autorisée pour l'aperçu.")
+        longueur = upstream.headers.get("content-length")
+        if longueur and longueur.isdigit() and int(longueur) > limite_octets:
+            raise HTTPException(status_code=413, detail="Ce document dépasse la taille autorisée pour l'aperçu.")
+        async for morceau in upstream.aiter_bytes():
+            contenu.extend(morceau)
+            if len(contenu) > limite_octets:
+                raise HTTPException(status_code=413, detail="Ce document dépasse la taille autorisée pour l'aperçu.")
     except HTTPException:
         raise
-    except httpx.HTTPError:
-        raise HTTPException(status_code=502, detail="Impossible de récupérer le document pour l'aperçu.")
+    except httpx.HTTPError as erreur:
+        logger.warning("Erreur de lecture aperçu bibliothèque document=%s type=%s", document_id, type(erreur).__name__)
+        raise HTTPException(status_code=502, detail="Le document n'a pas pu être lu depuis le stockage.")
+    finally:
+        await upstream.aclose()
+        await client.aclose()
+
     return Response(
         content=bytes(contenu),
         media_type=doc.fichier_type,
         headers={"Cache-Control": "private, max-age=120", "X-Content-Type-Options": "nosniff"},
     )
-
