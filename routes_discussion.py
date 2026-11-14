@@ -133,6 +133,16 @@ def _serialiser_messages(db: Session, classe_id: int, messages: list[ClasseDiscu
     usernames = {m.auteur_username for m in messages}
     usernames.update(p.auteur_username for p in parents)
     noms = _identites_comptes(db, usernames)
+    # Un seul chargement des curseurs de lecture pour toute la page (pas de N+1).
+    curseurs_lecture = {
+        username: int(dernier_id or 0)
+        for username, dernier_id, actif in db.query(
+            ClasseDiscussionMembre.username,
+            ClasseDiscussionMembre.dernier_message_lu_id,
+            ClasseDiscussionMembre.actif,
+        ).filter_by(discussion_id=messages[0].discussion_id).all()
+        if actif != 0
+    }
     resultats = []
     for message in messages:
         supprime = bool(getattr(message, "supprime_pour_tous", 0))
@@ -160,6 +170,10 @@ def _serialiser_messages(db: Session, classe_id: int, messages: list[ClasseDiscu
             "modifie": bool(getattr(message, "modifie", 0)) and not supprime,
             "modifie_le": message.modifie_le.isoformat() if getattr(message, "modifie_le", None) else None,
             "supprime_pour_tous": supprime,
+            "lu_par_au_moins_un": any(
+                lecteur != message.auteur_username and dernier_id >= int(message.id)
+                for lecteur, dernier_id in curseurs_lecture.items()
+            ),
         })
     return resultats
 
@@ -391,6 +405,41 @@ async def lister_messages(classe_id: int, session_token: str, before_id: int | N
         rows = q.order_by(ClasseDiscussionMessage.id.desc()).limit(limite).all()
         rows = list(reversed(rows))
     return {"messages": _serialiser_messages(db, classe.id, rows), "has_more": len(rows) == limite}
+
+
+@router.post("/api/classes/{classe_id}/discussion/lecture")
+async def marquer_messages_lus(classe_id: int, data: dict, db: Session = Depends(get_db)):
+    '''Enregistre le plus haut message réellement affiché par un membre actif.'''
+    username = _identite(data.get("session_token", ""), db)
+    _, discussion = _classe_et_discussion(db, classe_id)
+    membre = db.query(ClasseDiscussionMembre).filter_by(
+        discussion_id=discussion.id, username=username
+    ).with_for_update().first()
+    if membre is None or membre.actif == 0:
+        raise HTTPException(status_code=403, detail="Tu n'es pas membre de cette discussion.")
+
+    try:
+        dernier_id_demande = int(data.get("dernier_message_id") or 0)
+    except (TypeError, ValueError):
+        dernier_id_demande = 0
+    if dernier_id_demande <= 0:
+        raise HTTPException(status_code=400, detail="Position de lecture invalide.")
+
+    existe = db.query(ClasseDiscussionMessage.id).filter_by(
+        id=dernier_id_demande, discussion_id=discussion.id
+    ).first()
+    if existe is None:
+        raise HTTPException(status_code=404, detail="Message introuvable dans cette discussion.")
+
+    precedent = int(membre.dernier_message_lu_id or 0)
+    nouveau = max(precedent, dernier_id_demande)
+    if nouveau > precedent:
+        membre.dernier_message_lu_id = nouveau
+        db.commit()
+        await manager.diffuser_discussion(discussion.id, {
+            "type": "read_receipt", "username": username, "last_message_id": nouveau,
+        })
+    return {"success": True, "dernier_message_lu_id": nouveau}
 
 
 @router.post("/api/classes/{classe_id}/discussion/media-tickets")
