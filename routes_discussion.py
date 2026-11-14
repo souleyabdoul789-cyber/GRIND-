@@ -5,10 +5,11 @@ messages est une entité séparée, plafonnée à 200 membres, et peut donc incl
 des personnes qui ne prennent pas de siège dans la classe réelle.
 """
 from datetime import datetime, timedelta, timezone
+import logging
 import re
 import secrets
 import uuid
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, urljoin
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, File, Form, UploadFile
@@ -33,6 +34,7 @@ router = APIRouter()
 MAX_MESSAGE = 5000
 MAX_PAGE = 60
 MAX_VOCAL_OCTETS = 8 * 1024 * 1024
+logger = logging.getLogger("grind.discussion.media")
 
 
 def _identite(session_token: str, db: Session) -> str:
@@ -233,11 +235,13 @@ async def lister_messages(classe_id: int, session_token: str, before_id: int | N
 async def obtenir_piece_message(
     classe_id: int, message_id: int, request: Request, session_token: str,
     db: Session = Depends(get_db),
+    download: bool = False,
 ):
-    """Diffuse une pièce jointe uniquement aux membres actifs du groupe.
+    """Diffuse une pièce jointe aux seuls membres actifs, avec support Range.
 
-    Le proxy relaie Range/206 pour la lecture vidéo et ne charge pas le média
-    complet en mémoire. L'URL d'origine Cloudinary n'est jamais envoyée au client.
+    Cloudinary peut répondre par une redirection CDN. Elle est suivie explicitement
+    et chaque destination est vérifiée avant la requête suivante afin de ne pas
+    transformer ce proxy authentifié en proxy HTTP arbitraire.
     """
     username = _identite(session_token, db)
     classe, discussion = _classe_et_discussion(db, classe_id)
@@ -247,56 +251,95 @@ async def obtenir_piece_message(
     ).first()
     if message is None or not message.piece_url:
         raise HTTPException(status_code=404, detail="Pièce jointe introuvable.")
-    parsed = urlparse(message.piece_url)
+
+    current_url = message.piece_url
+    parsed = urlparse(current_url)
     if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
-        raise HTTPException(status_code=502, detail="Stockage de pièce jointe invalide.")
+        raise HTTPException(status_code=502, detail="La pièce jointe n'est pas disponible pour le moment.")
+
+    entetes = {"Accept-Encoding": "identity", "Accept": "*/*"}
+    range_header = request.headers.get("range")
+    # Les lecteurs HTML5 demandent des plages simples. On ne relaie pas les
+    # multi-ranges, qui exigeraient une réponse multipart dédiée.
+    if range_header and re.fullmatch(r"bytes=(?:\d+-\d*|-\d+)", range_header.strip()):
+        entetes["Range"] = range_header.strip()
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=20.0), follow_redirects=False)
-    entetes = {}
-    range_header = request.headers.get("range")
-    if range_header and re.fullmatch(r"bytes=\d*-\d*(?:,\d*-\d*)*", range_header):
-        entetes["Range"] = range_header
     upstream = None
     try:
-        upstream_request = client.build_request("GET", message.piece_url, headers=entetes)
-        upstream = await client.send(upstream_request, stream=True)
-        if upstream.status_code not in (200, 206):
+        for numero_redirection in range(5):
+            upstream_request = client.build_request("GET", current_url, headers=entetes)
+            upstream = await client.send(upstream_request, stream=True)
+            if upstream.status_code not in (301, 302, 303, 307, 308):
+                break
+
+            location = upstream.headers.get("location")
             await upstream.aclose()
-            await client.aclose()
-            raise HTTPException(status_code=502, detail="Impossible de récupérer la pièce jointe.")
+            upstream = None
+            if not location or numero_redirection == 4:
+                raise HTTPException(status_code=502, detail="La pièce jointe n'est pas disponible pour le moment.")
+            destination = urljoin(current_url, location)
+            cible = urlparse(destination)
+            hote = (cible.hostname or "").lower()
+            if cible.scheme != "https" or not (hote == "cloudinary.com" or hote.endswith(".cloudinary.com")):
+                logger.warning("Redirection de pièce jointe refusée pour message=%s host=%s", message_id, hote[:120])
+                raise HTTPException(status_code=502, detail="La pièce jointe n'est pas disponible pour le moment.")
+            current_url = destination
+
+        if upstream is None or upstream.status_code not in (200, 206):
+            status = upstream.status_code if upstream is not None else 0
+            erreur_cdn = (upstream.headers.get("x-cld-error") or "")[:240] if upstream is not None else ""
+            logger.warning(
+                "Échec de récupération Cloudinary message=%s status=%s erreur=%s",
+                message_id, status, erreur_cdn,
+            )
+            if upstream is not None:
+                await upstream.aclose()
+                upstream = None
+            raise HTTPException(status_code=502, detail="La pièce jointe n'est pas disponible pour le moment.")
+
         reponse_headers = {
             "Accept-Ranges": "bytes",
             "Cache-Control": "private, no-store",
             "X-Content-Type-Options": "nosniff",
             "Content-Disposition": (
-                f"inline; filename*=UTF-8''{quote(message.piece_nom or 'piece-jointe')}"
-                if message.piece_type in ("image", "video", "audio")
-                else f"attachment; filename*=UTF-8''{quote(message.piece_nom or 'document')}"
+                ("attachment" if download or message.piece_type == "document" else "inline")
+                + f"; filename*=UTF-8''{quote(message.piece_nom or 'piece-jointe', safe='')}"
             ),
         }
-        for header in ("content-length", "content-range"):
+        for header in ("content-length", "content-range", "etag", "last-modified"):
             if upstream.headers.get(header):
                 reponse_headers[header.title()] = upstream.headers[header]
 
         async def flux():
             try:
-                async for morceau in upstream.aiter_bytes():
+                # aiter_raw conserve exactement les octets et Content-Range du serveur
+                # de stockage. Accept-Encoding: identity évite la décompression implicite.
+                lecteur_brut = getattr(upstream, "aiter_raw", None)
+                flux_source = lecteur_brut() if lecteur_brut else upstream.aiter_bytes()
+                async for morceau in flux_source:
                     yield morceau
             finally:
                 await upstream.aclose()
                 await client.aclose()
 
+        # Les métadonnées vérifiées lors de l'envoi sont la référence du type du fichier.
+        # Cloudinary peut classer un vocal sous ressource "video" malgré un flux audio.
         media_type = message.piece_mime or upstream.headers.get("content-type") or "application/octet-stream"
         return StreamingResponse(
             flux(), status_code=upstream.status_code, media_type=media_type, headers=reponse_headers
         )
     except HTTPException:
-        raise
-    except httpx.HTTPError:
         if upstream is not None:
             await upstream.aclose()
         await client.aclose()
-        raise HTTPException(status_code=502, detail="Le stockage de pièce jointe est temporairement indisponible.")
+        raise
+    except httpx.HTTPError as error:
+        logger.warning("Erreur HTTP Cloudinary message=%s type=%s", message_id, type(error).__name__)
+        if upstream is not None:
+            await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Le stockage des pièces jointes est temporairement indisponible.")
 
 
 def _creer_notifications_message(db: Session, classe: Classe, discussion: ClasseDiscussion,
