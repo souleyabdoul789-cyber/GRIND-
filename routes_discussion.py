@@ -37,6 +37,36 @@ MAX_VOCAL_OCTETS = 8 * 1024 * 1024
 logger = logging.getLogger("grind.discussion.media")
 
 
+def _url_poster_video_cloudinary(source: str) -> str | None:
+    """Construit l'URL JPG de la première image d'une vidéo GRIND Cloudinary.
+
+    Le nom d'hôte et le chemin de ressource sont contrôlés : aucune URL externe
+    fournie par le client n'est acceptée. Les transformations de découpe existantes
+    sont conservées afin que l'image corresponde au début du clip.
+    """
+    parsed = urlparse(source or "")
+    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
+        return None
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 6 or parts[1:3] != ["video", "upload"]:
+        return None
+    # parts[0] = cloud name ; les segments avant v<version> sont des transformations.
+    version_index = next((i for i, part in enumerate(parts[3:], start=3) if re.fullmatch(r"v\d+", part)), None)
+    if version_index is None or version_index >= len(parts) - 1:
+        return None
+    transformations = parts[3:version_index]
+    if not any(re.search(r"(?:^|,)so_[^,]+", part) for part in transformations):
+        transformations = ["so_0"] + transformations
+    asset_parts = parts[version_index:]
+    filename = asset_parts[-1]
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    if not stem:
+        return None
+    asset_parts[-1] = stem + ".jpg"
+    new_parts = parts[:3] + transformations + asset_parts
+    return f"https://res.cloudinary.com/{'/'.join(new_parts)}"
+
+
 def _identite(session_token: str, db: Session) -> str:
     username = verifier_session(session_token, db)
     if not username:
@@ -236,8 +266,9 @@ async def obtenir_piece_message(
     classe_id: int, message_id: int, request: Request, session_token: str,
     db: Session = Depends(get_db),
     download: bool = False,
+    poster: bool = False,
 ):
-    """Diffuse une pièce jointe aux seuls membres actifs, avec support Range.
+    """Diffuse une pièce jointe ou son poster vidéo aux seuls membres actifs.
 
     Cloudinary peut répondre par une redirection CDN. Elle est suivie explicitement
     et chaque destination est vérifiée avant la requête suivante afin de ne pas
@@ -253,15 +284,23 @@ async def obtenir_piece_message(
         raise HTTPException(status_code=404, detail="Pièce jointe introuvable.")
 
     current_url = message.piece_url
+    media_poster = False
+    if poster:
+        if message.piece_type != "video":
+            raise HTTPException(status_code=400, detail="Aucune miniature vidéo pour cette pièce jointe.")
+        current_url = _url_poster_video_cloudinary(current_url)
+        if not current_url:
+            raise HTTPException(status_code=502, detail="La miniature de cette vidéo n'est pas disponible.")
+        media_poster = True
     parsed = urlparse(current_url)
     if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
         raise HTTPException(status_code=502, detail="La pièce jointe n'est pas disponible pour le moment.")
 
-    entetes = {"Accept-Encoding": "identity", "Accept": "*/*"}
+    entetes = {"Accept-Encoding": "identity", "Accept": "image/jpeg" if media_poster else "*/*"}
     range_header = request.headers.get("range")
     # Les lecteurs HTML5 demandent des plages simples. On ne relaie pas les
     # multi-ranges, qui exigeraient une réponse multipart dédiée.
-    if range_header and re.fullmatch(r"bytes=(?:\d+-\d*|-\d+)", range_header.strip()):
+    if not media_poster and range_header and re.fullmatch(r"bytes=(?:\d+-\d*|-\d+)", range_header.strip()):
         entetes["Range"] = range_header.strip()
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=20.0), follow_redirects=False)
@@ -300,9 +339,10 @@ async def obtenir_piece_message(
 
         reponse_headers = {
             "Accept-Ranges": "bytes",
-            "Cache-Control": "private, no-store",
+            "Cache-Control": "private, max-age=3600" if media_poster else "private, no-store",
             "X-Content-Type-Options": "nosniff",
             "Content-Disposition": (
+                "inline" if media_poster else
                 ("attachment" if download or message.piece_type == "document" else "inline")
                 + f"; filename*=UTF-8''{quote(message.piece_nom or 'piece-jointe', safe='')}"
             ),
@@ -325,7 +365,7 @@ async def obtenir_piece_message(
 
         # Les métadonnées vérifiées lors de l'envoi sont la référence du type du fichier.
         # Cloudinary peut classer un vocal sous ressource "video" malgré un flux audio.
-        media_type = message.piece_mime or upstream.headers.get("content-type") or "application/octet-stream"
+        media_type = "image/jpeg" if media_poster else (message.piece_mime or upstream.headers.get("content-type") or "application/octet-stream")
         return StreamingResponse(
             flux(), status_code=upstream.status_code, media_type=media_type, headers=reponse_headers
         )

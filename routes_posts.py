@@ -119,6 +119,7 @@ def _serialiser(post: Post, db: Session) -> dict:
         "media_items": _medias_post(post),
         "document_url": post.document_url,
         "document_name": post.document_name,
+        "document_title": getattr(post, "document_title", None),
         "document_type": post.document_type,
         "etablissement_id": post.etablissement_id,
         "auteur_type": post.auteur_type,
@@ -197,6 +198,7 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
     media_type = data.media_type
     document_url = (data.document_url or "").strip() or None
     document_name = (data.document_name or "").strip() or None
+    document_title = (data.document_title or "").strip()[:180] or None
     document_type = (data.document_type or "").strip() or None
     if media_type not in (None, "image", "video"):
         raise HTTPException(status_code=400, detail="Type de média non pris en charge.")
@@ -205,7 +207,6 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
     if not media_url and media_type:
         raise HTTPException(status_code=400, detail="Un type de média est fourni sans fichier associé.")
     if document_url:
-        categorie_document = (data.document_categorie or "").strip()[:120] or None
         if not document_url.startswith("https://res.cloudinary.com/") or document_type not in ("application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
             raise HTTPException(status_code=400, detail="Document PDF ou DOCX non valide : il doit provenir du stockage GRIND.")
         if not document_name or len(document_name) > 180:
@@ -214,8 +215,12 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
         extension_attendue = "pdf" if document_type == "application/pdf" else "docx"
         if extension != extension_attendue or "/grind_documents/" not in document_url:
             raise HTTPException(status_code=400, detail="Le document ne correspond pas au format ou à l'espace de stockage autorisé.")
-    elif data.document_categorie and data.document_categorie.strip():
-        raise HTTPException(status_code=400, detail="Une catégorie de document ne peut être fournie sans document joint.")
+        # Le schéma courant utilise document_title (et non document_categorie).
+        # Compatibilité avec les anciens clients : si le titre manque, dérive-le du nom du fichier.
+        if not document_title:
+            document_title = document_name.rsplit(".", 1)[0][:180] or "Document"
+    else:
+        document_title = None
     media_items = []
     for item in (data.media_items or []):
         if not isinstance(item, dict) or item.get("type") not in ("image", "video"):
@@ -248,8 +253,9 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
         date_limite=date_limite_parsed, statut="ouverte" if data.categorie == "probleme" else "publiee",
         media_url=media_url, media_type=media_type,
         medias_json=json.dumps(media_items, ensure_ascii=False) if media_items else None,
-        document_url=document_url, document_name=document_name, document_type=document_type,
-        etablissement_id=etablissement_id, auteur_type="proviseur" if candidature else "eleve",
+        document_url=document_url, document_name=document_name, document_title=document_title,
+        document_type=document_type, etablissement_id=etablissement_id,
+        auteur_type="proviseur" if candidature else "eleve",
     )
     db.add(post); db.flush()
 
@@ -261,10 +267,10 @@ async def creer_post(data: PostCreate, db: Session = Depends(get_db)):
         if not deja_reference:
             db.add(LibraryDocument(
                 playlist_id=playlist.id, auteur_username=username,
-                titre=(document_name or "Document")[:180],
+                titre=(document_title or document_name or "Document")[:180],
                 description=contenu[:2000] or None, fichier_url=document_url,
                 fichier_nom=document_name, fichier_type=document_type,
-                categorie_document=categorie_document,
+                categorie_document=None,
             ))
 
     _creer_notifications_mentions(contenu, username, post.id, db)
