@@ -192,3 +192,20 @@ async def envoyer_notifications_push(db, notifications):
             db.commit()
     except Exception as exc:
         logger.warning("Le relais FCM a échoué sans interrompre GRIND : %s", exc)
+
+
+async def envoyer_notifications_push_par_ids(notification_ids):
+    """Tâche de fond : recharge les notifications dans une session DB indépendante."""
+    ids = [int(x) for x in (notification_ids or []) if x]
+    if not ids:
+        return
+    from database import SessionLocal
+    from models import NotificationGrind
+    db = SessionLocal()
+    try:
+        notifications = db.query(NotificationGrind).filter(NotificationGrind.id.in_(ids)).all()
+        await envoyer_notifications_push(db, notifications)
+    except Exception as erreur:
+        logger.warning("Notification push différée ignorée: %s", type(erreur).__name__)
+    finally:
+        db.close()

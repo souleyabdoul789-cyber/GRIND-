@@ -1,23 +1,25 @@
 """Bibliothèque publique GRIND : playlists scolaires, documents, votes et avis."""
 from pathlib import Path
+import re
 import zipfile
 import logging
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, BackgroundTasks, Request
 from fastapi.responses import Response, StreamingResponse
 from urllib.parse import urlparse, urljoin, quote
 import httpx
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, func, case
 
 from database import get_db
 from auth_grind import verifier_session
 from models import (LibraryPlaylist, LibraryDocument, LibraryDocumentVote,
                     LibraryDocumentComment, NotificationGrind, CompteGrind)
+from media_access import creer_ticket_media, verifier_ticket_media
 from library_service import obtenir_playlist_globale
-from media import _envoyer_cloudinary
+from media import _envoyer_cloudinary, CLOUDINARY_CLOUD_NAME
 from cloudinary_delivery import url_privee_telechargement_raw
-from push_notifications import envoyer_notifications_push
+from push_notifications import envoyer_notifications_push_par_ids
 
 router = APIRouter()
 logger = logging.getLogger("grind.library.delivery")
@@ -51,23 +53,53 @@ def _playlist_par_defaut(db: Session, categorie: str | None = None, username: st
     return obtenir_playlist_globale(db)
 
 
+def _doc_payloads(db: Session, docs: list[LibraryDocument], lecteur: str):
+    """Sérialise une page avec agrégats SQL groupés, sans requête par document."""
+    if not docs:
+        return []
+    ids = [doc.id for doc in docs]
+    auteurs = {doc.auteur_username for doc in docs}
+    playlist_ids = {doc.playlist_id for doc in docs}
+    votes_agreges = db.query(
+        LibraryDocumentVote.document_id,
+        func.sum(case((LibraryDocumentVote.valeur == 1, 1), else_=0)).label("positifs"),
+        func.sum(case((LibraryDocumentVote.valeur == -1, 1), else_=0)).label("negatifs"),
+    ).filter(LibraryDocumentVote.document_id.in_(ids)).group_by(LibraryDocumentVote.document_id).all()
+    stats_votes = {row.document_id: (int(row.positifs or 0), int(row.negatifs or 0)) for row in votes_agreges}
+    mes_votes = dict(db.query(LibraryDocumentVote.document_id, LibraryDocumentVote.valeur).filter(
+        LibraryDocumentVote.document_id.in_(ids), LibraryDocumentVote.username == lecteur
+    ).all())
+    commentaires = dict(db.query(LibraryDocumentComment.document_id, func.count(LibraryDocumentComment.id))
+                        .filter(LibraryDocumentComment.document_id.in_(ids))
+                        .group_by(LibraryDocumentComment.document_id).all())
+    playlists = {p.id: p for p in db.query(LibraryPlaylist).filter(LibraryPlaylist.id.in_(playlist_ids)).all()}
+    comptes = {c.username: c for c in db.query(CompteGrind).filter(CompteGrind.username.in_(auteurs)).all()}
+    resultats = []
+    for doc in docs:
+        playlist = playlists.get(doc.playlist_id)
+        compte = comptes.get(doc.auteur_username)
+        positifs, negatifs = stats_votes.get(doc.id, (0, 0))
+        auteur = {
+            "username": doc.auteur_username,
+            "nom": (" ".join(x for x in [compte.prenom, compte.nom] if x).strip() if compte else "") or doc.auteur_username,
+            "avatar": None,
+        }
+        resultats.append({
+            "id": doc.id, "playlist_id": doc.playlist_id,
+            "playlist": playlist.titre if playlist else "Library",
+            "categorie": doc.categorie_document, "auteur": auteur,
+            "titre": doc.titre, "description": doc.description, "fichier_url": doc.fichier_url,
+            "fichier_nom": doc.fichier_nom, "fichier_type": doc.fichier_type,
+            "taille_octets": doc.taille_octets,
+            "date": doc.created_at.date().isoformat() if doc.created_at else None,
+            "votes_positifs": positifs, "votes_negatifs": negatifs,
+            "mon_vote": int(mes_votes.get(doc.id, 0)),
+            "commentaires": int(commentaires.get(doc.id, 0)),
+        })
+    return resultats
+
 def _doc_payload(db: Session, doc: LibraryDocument, lecteur: str):
-    votes = db.query(LibraryDocumentVote).filter_by(document_id=doc.id).all()
-    comments = db.query(LibraryDocumentComment).filter_by(document_id=doc.id).count()
-    my_vote = next((v.valeur for v in votes if v.username == lecteur), 0)
-    playlist = db.get(LibraryPlaylist, doc.playlist_id)
-    auteur = _identite(db, doc.auteur_username)
-    return {
-        "id": doc.id, "playlist_id": doc.playlist_id, "playlist": playlist.titre if playlist else "Library",
-        "categorie": doc.categorie_document, "auteur": auteur,
-        "titre": doc.titre, "description": doc.description, "fichier_url": doc.fichier_url,
-        "fichier_nom": doc.fichier_nom, "fichier_type": doc.fichier_type,
-        "taille_octets": doc.taille_octets,
-        "date": doc.created_at.date().isoformat() if doc.created_at else None,
-        "votes_positifs": sum(1 for v in votes if v.valeur == 1),
-        "votes_negatifs": sum(1 for v in votes if v.valeur == -1),
-        "mon_vote": my_vote, "commentaires": comments,
-    }
+    return _doc_payloads(db, [doc], lecteur)[0]
 
 
 @router.get("/api/library/categories")
@@ -80,7 +112,10 @@ async def lister_playlists(session_token: str, categorie: str | None = None, q: 
                            db: Session = Depends(get_db), offset: int = 0, limit: int = 100):
     lecteur = _user(session_token, db)
     obtenir_playlist_globale(db)
-    db.commit()
+    # Le premier accès peut encore migrer les anciennes playlists système ;
+    # les lectures suivantes restent sans commit lorsqu'aucune donnée n'a changé.
+    if db.new or db.dirty or db.deleted:
+        db.commit()
     query = db.query(LibraryPlaylist).filter(LibraryPlaylist.public == 1)
     if q:
         q = q.strip()[:100]
@@ -89,9 +124,16 @@ async def lister_playlists(session_token: str, categorie: str | None = None, q: 
     decalage = max(0, int(offset))
     limite = min(100, max(1, int(limit)))
     playlists = query.order_by(LibraryPlaylist.est_defaut.desc(), LibraryPlaylist.created_at.desc()).offset(decalage).limit(limite).all()
+    createurs = {p.createur_username for p in playlists}
+    comptes = {c.username: c for c in db.query(CompteGrind).filter(CompteGrind.username.in_(createurs)).all()} if createurs else {}
+    compte_docs = dict(db.query(LibraryDocument.playlist_id, func.count(LibraryDocument.id)).filter(
+        LibraryDocument.playlist_id.in_([p.id for p in playlists])
+    ).group_by(LibraryDocument.playlist_id).all()) if playlists else {}
     result = []
     for p in playlists:
-        result.append({"id":p.id,"titre":p.titre,"description":p.description,"categorie":p.categorie,"createur":_identite(db,p.createur_username),"est_defaut":bool(p.est_defaut),"documents":db.query(LibraryDocument).filter_by(playlist_id=p.id).count()})
+        compte = comptes.get(p.createur_username)
+        createur = {"username": p.createur_username, "nom": (" ".join(x for x in [compte.prenom, compte.nom] if x).strip() if compte else "") or p.createur_username, "avatar": None}
+        result.append({"id":p.id,"titre":p.titre,"description":p.description,"categorie":p.categorie,"createur":createur,"est_defaut":bool(p.est_defaut),"documents":int(compte_docs.get(p.id, 0))})
     return {"playlists": result, "total": total, "offset": decalage, "limit": limite, "has_more": decalage + len(result) < total}
 
 
@@ -158,7 +200,11 @@ async def publier_document_library(
     params = {"folder":"grind_library", "allowed_formats":"pdf,docx,xlsx,xls,csv"}
     result = await media_service._envoyer_cloudinary(file, filename, mime, "raw", params)
     url = result.get("secure_url")
-    if not url or not url.startswith("https://res.cloudinary.com/"):
+    from urllib.parse import urlparse
+    parsed_upload = urlparse(str(url or ""))
+    if (parsed_upload.scheme != "https" or parsed_upload.hostname != "res.cloudinary.com"
+            or parsed_upload.port not in (None, 443) or not CLOUDINARY_CLOUD_NAME
+            or parsed_upload.path.strip("/").split("/", 1)[0] != CLOUDINARY_CLOUD_NAME):
         raise HTTPException(status_code=502, detail="Le stockage n’a pas retourné un fichier exploitable.")
     doc = LibraryDocument(playlist_id=p.id, auteur_username=username, titre=titre.strip()[:180] or filename, description=description.strip()[:2000] or None, fichier_url=url, fichier_nom=filename, fichier_type=mime, taille_octets=size, categorie_document=categorie_document)
     db.add(doc); db.commit(); db.refresh(doc)
@@ -182,7 +228,7 @@ async def lister_documents_library(playlist_id: int, session_token: str, q: str 
     docs = query.order_by(LibraryDocument.created_at.desc(), LibraryDocument.id.desc()).offset(decalage).limit(limite).all()
     return {
         "playlist":{"id":p.id,"titre":p.titre,"categorie":p.categorie,"description":p.description},
-        "documents":[_doc_payload(db,d,username) for d in docs],
+        "documents": _doc_payloads(db, docs, username),
         "total": total, "offset": decalage, "limit": limite,
         "has_more": decalage + len(docs) < total,
     }
@@ -212,14 +258,14 @@ async def rechercher_documents_library(
     limite = min(100, max(1, int(limit)))
     docs = query.order_by(LibraryDocument.created_at.desc(), LibraryDocument.id.desc()).offset(decalage).limit(limite).all()
     return {
-        "documents": [_doc_payload(db, doc, username) for doc in docs],
+        "documents": _doc_payloads(db, docs, username),
         "total": total, "offset": decalage, "limit": limite,
         "has_more": decalage + len(docs) < total,
     }
 
 
 @router.post("/api/library/documents/{document_id}/vote")
-async def voter_document(document_id: int, data: dict, db: Session = Depends(get_db)):
+async def voter_document(document_id: int, data: dict, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     username = _user(data.get("session_token", ""), db)
     valeur = data.get("valeur")
     if valeur not in (-1, 1): raise HTTPException(status_code=400, detail="Vote invalide.")
@@ -237,12 +283,13 @@ async def voter_document(document_id: int, data: dict, db: Session = Depends(get
         db.add(NotificationGrind(destinataire_username=doc.auteur_username, acteur_username=username, type="avis_doc", resource_type="library_document", resource_id=doc.id, extrait=f"a évalué « {doc.titre[:160]} »"))
     notifications_push = [item for item in db.new if isinstance(item, NotificationGrind)]
     db.commit()
-    await envoyer_notifications_push(db, notifications_push)
+    if notifications_push:
+        background_tasks.add_task(envoyer_notifications_push_par_ids, [item.id for item in notifications_push if item.id])
     return {"success":True}
 
 
 @router.post("/api/library/documents/{document_id}/commentaires")
-async def commenter_document(document_id: int, data: dict, db: Session = Depends(get_db)):
+async def commenter_document(document_id: int, data: dict, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     username = _user(data.get("session_token", ""), db)
     contenu = (data.get("contenu") or "").strip()
     if not contenu or len(contenu) > 2000: raise HTTPException(status_code=400, detail="Le commentaire doit contenir entre 1 et 2 000 caractères.")
@@ -254,7 +301,8 @@ async def commenter_document(document_id: int, data: dict, db: Session = Depends
         db.add(NotificationGrind(destinataire_username=doc.auteur_username, acteur_username=username, type="commentaire_doc", resource_type="library_document", resource_id=doc.id, extrait=f"a commenté « {doc.titre[:150]} »"))
     notifications_push = [item for item in db.new if isinstance(item, NotificationGrind)]
     db.commit()
-    await envoyer_notifications_push(db, notifications_push)
+    if notifications_push:
+        background_tasks.add_task(envoyer_notifications_push_par_ids, [item.id for item in notifications_push if item.id])
     db.refresh(comment)
     return {"success":True,"commentaire":{"id":comment.id,"username":username,"nom":_identite(db,username)["nom"],"contenu":contenu,"date":comment.created_at.isoformat() if comment.created_at else None}}
 
@@ -264,7 +312,9 @@ async def lister_commentaires_document(document_id: int, session_token: str, db:
     username = _user(session_token, db)
     if not db.get(LibraryDocument, document_id): raise HTTPException(status_code=404, detail="Document introuvable.")
     rows = db.query(LibraryDocumentComment).filter_by(document_id=document_id).order_by(LibraryDocumentComment.created_at.asc()).limit(300).all()
-    return {"commentaires":[{"id":c.id,"username":c.username,"nom":_identite(db,c.username)["nom"],"contenu":c.contenu,"date":c.created_at.isoformat() if c.created_at else None} for c in rows]}
+    usernames = {row.username for row in rows}
+    comptes = {c.username: c for c in db.query(CompteGrind).filter(CompteGrind.username.in_(usernames)).all()} if usernames else {}
+    return {"commentaires":[{"id":c.id,"username":c.username,"nom":(" ".join(x for x in [comptes[c.username].prenom, comptes[c.username].nom] if x).strip() if c.username in comptes else "") or c.username,"contenu":c.contenu,"date":c.created_at.isoformat() if c.created_at else None} for c in rows]}
 
 
 
@@ -279,10 +329,12 @@ async def obtenir_document_library(document_id: int, session_token: str, db: Ses
         raise HTTPException(status_code=404, detail="Document introuvable.")
     return {"document": _doc_payload(db, doc, username), "playlist": {"id": playlist.id, "titre": playlist.titre, "categorie": playlist.categorie, "description": playlist.description}}
 
-async def _ouvrir_document_stockage(doc: LibraryDocument):
+async def _ouvrir_document_stockage(doc: LibraryDocument, range_header: str | None = None):
     """Ouvre un document depuis Cloudinary, avec fallback signé uniquement sur HTTP 401."""
     parsed = urlparse(doc.fichier_url or "")
-    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
+    if (parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com"
+            or parsed.port not in (None, 443) or not CLOUDINARY_CLOUD_NAME
+            or parsed.path.strip("/").split("/", 1)[0] != CLOUDINARY_CLOUD_NAME):
         raise HTTPException(status_code=502, detail="La source du document n'est pas reconnue.")
 
     extension = Path(doc.fichier_nom or "").suffix.lower().lstrip(".")
@@ -290,6 +342,9 @@ async def _ouvrir_document_stockage(doc: LibraryDocument):
         raise HTTPException(status_code=415, detail="Ce format de document n'est pas pris en charge.")
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0), follow_redirects=False)
+    entetes = {"Accept-Encoding": "identity", "Accept": "application/octet-stream"}
+    if range_header and re.fullmatch(r"bytes=(?:\d+-\d*|-[0-9]+)", range_header.strip()):
+        entetes["Range"] = range_header.strip()
     urls = [doc.fichier_url]
     upstream = None
     try:
@@ -305,7 +360,7 @@ async def _ouvrir_document_stockage(doc: LibraryDocument):
             current_url = urls[-1]
             for numero in range(5):
                 upstream = await client.send(
-                    client.build_request("GET", current_url, headers={"Accept-Encoding": "identity", "Accept": "application/octet-stream"}),
+                    client.build_request("GET", current_url, headers=entetes),
                     stream=True,
                 )
                 if upstream.status_code not in (301, 302, 303, 307, 308):
@@ -319,12 +374,12 @@ async def _ouvrir_document_stockage(doc: LibraryDocument):
                 cible = urlparse(destination)
                 host = (cible.hostname or "").lower()
                 autorise = host == "cloudinary.com" or host.endswith(".cloudinary.com")
-                if cible.scheme != "https" or not autorise:
+                if cible.scheme != "https" or cible.port not in (None, 443) or not autorise:
                     logger.warning("Redirection de document refusée: document=%s host=%s", doc.id, host[:120])
                     break
                 current_url = destination
 
-            if upstream is not None and upstream.status_code == 200:
+            if upstream is not None and upstream.status_code in (200, 206):
                 return client, upstream
 
             status = upstream.status_code if upstream is not None else 0
@@ -352,26 +407,50 @@ async def _ouvrir_document_stockage(doc: LibraryDocument):
         raise HTTPException(status_code=502, detail="Impossible de récupérer ce document depuis le stockage.")
 
 
-@router.get("/api/library/documents/{document_id}/download")
-async def telecharger_document_library(document_id: int, session_token: str, db: Session = Depends(get_db)):
-    """Téléchargement authentifié relayé par GRIND, jamais par l'URL Cloudinary brute."""
-    _user(session_token, db)
+@router.post("/api/library/documents/{document_id}/media-ticket")
+async def creer_ticket_document_library(document_id: int, data: dict, db: Session = Depends(get_db)):
+    username = _user(data.get("session_token", ""), db)
     doc = db.get(LibraryDocument, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document introuvable.")
     playlist = db.get(LibraryPlaylist, doc.playlist_id)
     if not playlist or not playlist.public:
         raise HTTPException(status_code=404, detail="Document introuvable.")
+    purpose = str(data.get("purpose") or "preview")
+    if purpose not in {"preview", "download"}:
+        raise HTTPException(status_code=400, detail="Opération média invalide.")
+    duree = 300 if purpose == "download" else 3600
+    ticket = creer_ticket_media(db, username=username, resource_type="library", resource_id=document_id,
+                                container_id=playlist.id, purpose=purpose, duree=duree)
+    db.commit()
+    suffixe = "download" if purpose == "download" else "preview"
+    return {"url": f"/api/library/documents/{document_id}/{suffixe}?ticket={ticket}", "expires_in": duree}
 
-    client, upstream = await _ouvrir_document_stockage(doc)
+@router.get("/api/library/documents/{document_id}/download")
+async def telecharger_document_library(document_id: int, request: Request, ticket: str | None = None, session_token: str | None = None, db: Session = Depends(get_db)):
+    """Téléchargement relayé par GRIND, autorisé par session ou ticket ponctuel."""
+    if ticket:
+        autorisation = verifier_ticket_media(db, ticket, resource_type="library", resource_id=document_id, purpose="download")
+        username = autorisation.username
+    else:
+        username = _user(session_token or "", db)
+    doc = db.get(LibraryDocument, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document introuvable.")
+    playlist = db.get(LibraryPlaylist, doc.playlist_id)
+    if not playlist or not playlist.public or (ticket and autorisation.container_id != playlist.id):
+        raise HTTPException(status_code=404, detail="Document introuvable.")
+
+    client, upstream = await _ouvrir_document_stockage(doc, request.headers.get("range"))
     nom = Path(doc.fichier_nom or "document").name[:180]
     headers = {
         "Content-Disposition": f"attachment; filename*=UTF-8''{quote(nom, safe='')}",
         "Cache-Control": "private, no-store",
         "X-Content-Type-Options": "nosniff",
     }
-    if upstream.headers.get("content-length"):
-        headers["Content-Length"] = upstream.headers["content-length"]
+    for nom_entete in ("content-length", "content-range", "accept-ranges"):
+        if upstream.headers.get(nom_entete):
+            headers[nom_entete.title()] = upstream.headers[nom_entete]
 
     async def flux():
         try:
@@ -381,28 +460,49 @@ async def telecharger_document_library(document_id: int, session_token: str, db:
             await upstream.aclose()
             await client.aclose()
 
-    return StreamingResponse(flux(), media_type=doc.fichier_type or "application/octet-stream", headers=headers)
+    return StreamingResponse(flux(), status_code=upstream.status_code,
+                             media_type=doc.fichier_type or "application/octet-stream", headers=headers)
 
 
 @router.get("/api/library/documents/{document_id}/preview")
-async def previsualiser_document_library(document_id: int, session_token: str, db: Session = Depends(get_db)):
-    """Aperçu authentifié : même livraison sécurisée que le téléchargement, sans URL Cloudinary côté client."""
-    _user(session_token, db)
+async def previsualiser_document_library(document_id: int, request: Request, ticket: str | None = None, session_token: str | None = None, db: Session = Depends(get_db)):
+    """Aperçu autorisé par session ou ticket ponctuel, sans URL Cloudinary côté client."""
+    if ticket:
+        autorisation = verifier_ticket_media(db, ticket, resource_type="library", resource_id=document_id, purpose="preview")
+        username = autorisation.username
+    else:
+        username = _user(session_token or "", db)
     doc = db.get(LibraryDocument, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document introuvable.")
     playlist = db.get(LibraryPlaylist, doc.playlist_id)
-    if not playlist or not playlist.public:
+    if not playlist or not playlist.public or (ticket and autorisation.container_id != playlist.id):
         raise HTTPException(status_code=404, detail="Document introuvable.")
 
-    client, upstream = await _ouvrir_document_stockage(doc)
+    client, upstream = await _ouvrir_document_stockage(doc, request.headers.get("range"))
+    # L'aperçu PDF peut être lu progressivement par le viewer natif via HTTP Range.
+    if upstream.status_code == 206:
+        content_range = upstream.headers.get("content-range", "")
+        match_range = re.fullmatch(r"bytes \d+-\d+/(\d+|\*)", content_range.strip())
+        if match_range and match_range.group(1).isdigit() and int(match_range.group(1)) > 30 * 1024 * 1024:
+            await upstream.aclose(); await client.aclose()
+            raise HTTPException(status_code=413, detail="Ce document dépasse la taille autorisée pour l'aperçu.")
+        headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "Content-Disposition": f"inline; filename*=UTF-8''{quote(Path(doc.fichier_nom or 'document').name, safe='')}"}
+        for header in ("content-length", "content-range", "accept-ranges"):
+            if upstream.headers.get(header): headers[header.title()] = upstream.headers[header]
+        async def flux_range():
+            try:
+                async for chunk in upstream.aiter_raw(): yield chunk
+            finally:
+                await upstream.aclose(); await client.aclose()
+        return StreamingResponse(flux_range(), status_code=206, media_type=doc.fichier_type, headers=headers)
     contenu = bytearray()
     limite_octets = 30 * 1024 * 1024
+    longueur = upstream.headers.get("content-length")
     try:
-        longueur = upstream.headers.get("content-length")
         if longueur and longueur.isdigit() and int(longueur) > limite_octets:
             raise HTTPException(status_code=413, detail="Ce document dépasse la taille autorisée pour l'aperçu.")
-        async for morceau in upstream.aiter_bytes():
+        async for morceau in upstream.aiter_raw():
             contenu.extend(morceau)
             if len(contenu) > limite_octets:
                 raise HTTPException(status_code=413, detail="Ce document dépasse la taille autorisée pour l'aperçu.")
@@ -415,8 +515,6 @@ async def previsualiser_document_library(document_id: int, session_token: str, d
         await upstream.aclose()
         await client.aclose()
 
-    return Response(
-        content=bytes(contenu),
-        media_type=doc.fichier_type,
-        headers={"Cache-Control": "private, max-age=120", "X-Content-Type-Options": "nosniff"},
-    )
+    return Response(content=bytes(contenu), media_type=doc.fichier_type,
+                    headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+                             "Content-Disposition": f"inline; filename*=UTF-8''{quote(Path(doc.fichier_nom or 'document').name, safe='')}"})

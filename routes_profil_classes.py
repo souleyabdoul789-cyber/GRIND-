@@ -2,12 +2,13 @@ import json
 import re
 import secrets
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import get_db
 from auth_grind import verifier_session
 from schemas import ProfilCreate, ClasseCreate, ClasseRejoindre, ClasseRenommer, ClasseTransfererProf
-from moderation import badge_de, sanction_active
+from moderation import badge_de, sanction_active, usernames_sanctionnes
 from scolaire import (
     ErreurValidation, valider_age, valider_texte_scolaire, valider_difficultes_libres,
     valider_texte_libre, valider_classe, cle_doublon_classe, composer_nom_classe,
@@ -193,13 +194,19 @@ async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
         nom=valide["nom"], niveau=valide["niveau"], matiere=valide["matiere"], complement=valide["complement"],
         code_invitation=code, createur_username=username, prof_username=username,
     )
-    db.add(classe)
-    db.commit()
-    db.refresh(classe)
-
-    db.add(ClasseMembre(classe_id=classe.id, username=username, role="prof", siege_index=None))
-    assurer_discussion(db, classe)
-    db.commit()
+    # Une seule transaction : la classe ne peut pas rester sans propriétaire
+    # ni discussion si une étape intermédiaire échoue. assurer_discussion()
+    # utilise flush() et ne valide jamais la transaction elle-même.
+    try:
+        db.add(classe)
+        db.flush()
+        db.add(ClasseMembre(classe_id=classe.id, username=username, role="prof", siege_index=None))
+        assurer_discussion(db, classe)
+        db.commit()
+        db.refresh(classe)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="La classe n'a pas pu être créée. Réessaie sans fermer l'application.")
 
     return {
         "success": True,
@@ -255,80 +262,95 @@ async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db))
 @router.get("/api/classes/mes-classes")
 async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
     username = _identite(session_token, db)
+    memberships = db.query(ClasseMembre).filter(ClasseMembre.username == username).all()
+    discussions_membres = db.query(ClasseDiscussionMembre).filter_by(username=username, actif=1).all()
+    classe_ids = {m.classe_id for m in memberships}
+    discussion_ids_utilisateur = {m.discussion_id for m in discussions_membres}
+
+    discussions_user = db.query(ClasseDiscussion).filter(ClasseDiscussion.id.in_(discussion_ids_utilisateur)).all() if discussion_ids_utilisateur else []
+    classe_ids.update(d.classe_id for d in discussions_user)
+    if not classe_ids:
+        return {"classes": []}
+
+    classes = db.query(Classe).filter(Classe.id.in_(classe_ids)).all()
+    classes_map = {c.id: c for c in classes}
+    membres_classes = db.query(ClasseMembre).filter(ClasseMembre.classe_id.in_(classe_ids)).order_by(ClasseMembre.id.asc()).all()
+    membres_par_classe = {}
+    for membre in membres_classes:
+        membres_par_classe.setdefault(membre.classe_id, []).append(membre)
+
+    discussions = db.query(ClasseDiscussion).filter(ClasseDiscussion.classe_id.in_(classe_ids)).all()
+    discussions_map = {d.classe_id: d for d in discussions}
+    discussions_actifs = db.query(ClasseDiscussionMembre.discussion_id, func.count(ClasseDiscussionMembre.id)).filter(
+        ClasseDiscussionMembre.discussion_id.in_([d.id for d in discussions]), ClasseDiscussionMembre.actif == 1
+    ).group_by(ClasseDiscussionMembre.discussion_id).all() if discussions else []
+    nb_discussion_par_id = {did: int(total) for did, total in discussions_actifs}
+    membres_discussion_existants = db.query(ClasseDiscussionMembre).filter(
+        ClasseDiscussionMembre.discussion_id.in_([d.id for d in discussions])
+    ).all() if discussions else []
+    pseudos_par_discussion = {}
+    for dm in membres_discussion_existants:
+        pseudos_par_discussion.setdefault(dm.discussion_id, set()).add(dm.username)
+    nb_classes_par_id = {cid: len(membres_par_classe.get(cid, [])) for cid in classe_ids}
+    membre_discussion_ids = {m.discussion_id for m in discussions_membres}
+    membre_classe_ids = {m.classe_id for m in memberships}
+    role_classe = {m.classe_id: m.role for m in memberships}
+    role_discussion = {m.discussion_id: m.role for m in discussions_membres}
 
     resultat = []
-    deja = set()
-    memberships = db.query(ClasseMembre).filter(ClasseMembre.username == username).all()
-    for m in memberships:
-        classe = db.get(Classe, m.classe_id)
+    sanctions_actives = usernames_sanctionnes(db)
+    # Conserve l'ordre historique : classes scolaires d'abord, puis groupes seuls.
+    ordre_classes = list(dict.fromkeys([m.classe_id for m in memberships] + [d.classe_id for d in discussions_user]))
+    for classe_id in ordre_classes:
+        classe = classes_map.get(classe_id)
         if classe is None:
             continue
-        assurer_prof_et_sieges(db, classe)
-        discussion = assurer_discussion(db, classe)
-        nb_membres = db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count()
-        nb_discussion = db.query(ClasseDiscussionMembre).filter_by(discussion_id=discussion.id, actif=1).count()
-        adhesion_discussion = db.query(ClasseDiscussionMembre).filter_by(
-            discussion_id=discussion.id, username=username, actif=1
-        ).first()
+        membres_locaux = membres_par_classe.get(classe.id, [])
+        # Répare les sièges en mémoire sans refaire une requête SQL par classe.
+        assurer_prof_et_sieges(db, classe, membres_locaux)
+        discussion = discussions_map.get(classe.id)
+        if discussion is None:
+            discussion = assurer_discussion(db, classe)
+            discussions_map[classe.id] = discussion
+            pseudos_par_discussion[discussion.id] = {m.username for m in membres_locaux}
+            if discussion.owner_username:
+                pseudos_par_discussion[discussion.id].add(discussion.owner_username)
+            nb_discussion_par_id[discussion.id] = len(pseudos_par_discussion[discussion.id])
+        else:
+            pseudos_connus = pseudos_par_discussion.get(discussion.id, set())
+            manque = discussion.owner_username not in pseudos_connus or any(m.username not in pseudos_connus for m in membres_locaux)
+            if manque:
+                discussion = assurer_discussion(db, classe)
+                nouveaux = db.query(ClasseDiscussionMembre.username).filter_by(discussion_id=discussion.id, actif=1).all()
+                pseudos_par_discussion[discussion.id] = {row[0] for row in nouveaux}
+                nb_discussion_par_id[discussion.id] = len(pseudos_par_discussion[discussion.id])
+        if username in pseudos_par_discussion.get(discussion.id, set()):
+            membre_discussion_ids.add(discussion.id)
+            if discussion.owner_username == username:
+                role_discussion[discussion.id] = "owner"
         resultat.append({
-            "classe_id": classe.id,
-            "nom": classe.nom,
-            "role": m.role,
+            "classe_id": classe.id, "nom": classe.nom,
+            "role": role_classe.get(classe.id, role_discussion.get(discussion.id, "membre")),
             "code_invitation": classe.code_invitation,
-            "nb_membres": nb_membres,
+            "nb_membres": nb_classes_par_id.get(classe.id, 0),
             "prof_actuel": classe.prof_username or classe.createur_username,
             "owner_username": classe.createur_username,
             "est_owner": username == classe.createur_username,
-            "suspendue": sanction_active(db, classe.createur_username) is not None,
-            "niveau": classe.niveau,
-            "matiere": classe.matiere,
-            "complement": classe.complement,
-            "est_membre_classe": True,
-            "est_membre_discussion": adhesion_discussion is not None,
+            "suspendue": classe.createur_username in sanctions_actives,
+            "niveau": classe.niveau, "matiere": classe.matiere, "complement": classe.complement,
+            "est_membre_classe": classe.id in membre_classe_ids,
+            "est_membre_discussion": discussion.id in membre_discussion_ids,
             "discussion_id": discussion.id,
-            "discussion_membres": nb_discussion,
+            "discussion_membres": nb_discussion_par_id.get(discussion.id, 0),
             "discussion_invitation": discussion.code_invitation,
         })
-        deja.add(classe.id)
 
-    # Un membre du groupe peut participer à la discussion sans occuper l'un des
-    # 10 sièges de la classe scolaire. La carte reste visible avec une action
-    # distincte « rejoindre la vraie classe ».
-    discussions = db.query(ClasseDiscussionMembre).filter_by(username=username, actif=1).all()
-    for dm in discussions:
-        discussion = db.get(ClasseDiscussion, dm.discussion_id)
-        if discussion is None or discussion.classe_id in deja:
-            continue
-        classe = db.get(Classe, discussion.classe_id)
-        if classe is None:
-            continue
-        assurer_prof_et_sieges(db, classe)
-        nb_membres = db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count()
-        nb_discussion = db.query(ClasseDiscussionMembre).filter_by(discussion_id=discussion.id, actif=1).count()
-        resultat.append({
-            "classe_id": classe.id,
-            "nom": classe.nom,
-            "role": dm.role,
-            "code_invitation": classe.code_invitation,
-            "nb_membres": nb_membres,
-            "prof_actuel": classe.prof_username or classe.createur_username,
-            "owner_username": classe.createur_username,
-            "est_owner": username == classe.createur_username,
-            "suspendue": sanction_active(db, classe.createur_username) is not None,
-            "niveau": classe.niveau,
-            "matiere": classe.matiere,
-            "complement": classe.complement,
-            "est_membre_classe": False,
-            "est_membre_discussion": True,
-            "discussion_id": discussion.id,
-            "discussion_membres": nb_discussion,
-            "discussion_invitation": discussion.code_invitation,
-        })
-        deja.add(classe.id)
-
-    db.commit()  # persiste la création lazy des groupes pour les classes historiques
+    # La route reste compatible avec les anciennes classes nécessitant une
+    # réparation paresseuse, mais une lecture sans changement ne force plus
+    # une transaction d'écriture inutile.
+    if db.new or db.dirty or db.deleted:
+        db.commit()
     return {"classes": resultat}
-
 
 @router.patch("/api/classes/{classe_id}")
 async def renommer_classe(classe_id: int, data: ClasseRenommer, db: Session = Depends(get_db)):

@@ -10,7 +10,8 @@ from models import (
     SupportMessage, Examen, Blocage, VerificationEmail, NotificationGrind,
     LibraryPlaylist, LibraryDocument, LibraryDocumentVote, LibraryDocumentComment, GrindPushToken,
     ClasseDiscussion, ClasseDiscussionMembre, ClasseDiscussionMessage,
-    ClasseDiscussionMention, CountryAccessBlock,
+    ClasseDiscussionMention, CountryAccessBlock, GrindMediaAsset,
+    GrindMediaAccessTicket,
 )
 from models_proviseur import ProviseurCandidature, ProviseurDocument, ProviseurAutorisation, Etablissement
 from library_service import obtenir_playlist_globale
@@ -239,6 +240,12 @@ def purger_compte(db, username: str) -> list[str]:
         ((NotificationGrind.resource_type == "classe_discussion_message") & NotificationGrind.resource_id.in_(message_ids_supprimes or [-1])),
     )).delete(synchronize_session=False)
     db.query(CountryAccessBlock).filter(CountryAccessBlock.modifie_par == username).update({CountryAccessBlock.modifie_par: None}, synchronize_session=False)
+
+    # Les tickets et le registre média référencent le compte par clé étrangère.
+    # Ils doivent être supprimés avant CompteGrind pour que la purge définitive
+    # reste transactionnelle et ne soit pas bloquée par les nouvelles tables 2.10.9.
+    db.query(GrindMediaAccessTicket).filter_by(username=username).delete(synchronize_session=False)
+    db.query(GrindMediaAsset).filter_by(username=username).delete(synchronize_session=False)
 
     db.delete(compte)
     db.flush()

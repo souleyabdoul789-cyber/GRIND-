@@ -6,13 +6,14 @@ des personnes qui ne prennent pas de siège dans la classe réelle.
 """
 from datetime import datetime, timedelta, timezone
 import logging
+import hashlib
 import re
 import secrets
 import uuid
 from urllib.parse import urlparse, quote, urljoin
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, File, Form, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, File, Form, UploadFile, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -23,13 +24,14 @@ from discussion_service import assurer_discussion, MAX_MEMBRES_DISCUSSION
 from models import (
     Classe, ClasseMembre, ClasseDiscussion, ClasseDiscussionMembre,
     ClasseDiscussionMessage, ClasseDiscussionMessageMasque, ClasseDiscussionMention, CompteGrind,
-    NotificationGrind,
+    NotificationGrind, GrindMediaAccessTicket,
 )
 from ws_manager import manager
 from moderation import sanction_active
-from push_notifications import envoyer_notifications_push, envoyer_push_a_utilisateur
-from media import _envoyer_cloudinary, _informations_fichier
+from push_notifications import envoyer_notifications_push, envoyer_push_a_utilisateur, envoyer_notifications_push_par_ids
+from media import _envoyer_cloudinary, _informations_fichier, CLOUDINARY_CLOUD_NAME
 from cloudinary_delivery import url_privee_telechargement_raw
+from media_access import creer_ticket_media, verifier_ticket_media
 
 router = APIRouter()
 MAX_MESSAGE = 5000
@@ -51,10 +53,10 @@ def _url_poster_video_cloudinary(source: str) -> str | None:
     sont conservées afin que l'image corresponde au début du clip.
     """
     parsed = urlparse(source or "")
-    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
+    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com" or parsed.port not in (None, 443):
         return None
     parts = parsed.path.strip("/").split("/")
-    if len(parts) < 6 or parts[1:3] != ["video", "upload"]:
+    if not CLOUDINARY_CLOUD_NAME or len(parts) < 6 or parts[0] != CLOUDINARY_CLOUD_NAME or parts[1:3] != ["video", "upload"]:
         return None
     # parts[0] = cloud name ; les segments avant v<version> sont des transformations.
     version_index = next((i for i, part in enumerate(parts[3:], start=3) if re.fullmatch(r"v\d+", part)), None)
@@ -110,51 +112,117 @@ def _nom_compte(db: Session, username: str) -> str:
     return " ".join(x for x in [compte.prenom, compte.nom] if x).strip() or username
 
 
-def _serialiser_message(db: Session, classe_id: int, message: ClasseDiscussionMessage) -> dict:
-    supprime = bool(getattr(message, "supprime_pour_tous", 0))
-    parent = db.get(ClasseDiscussionMessage, message.reply_to_id) if message.reply_to_id else None
-    parent_supprime = bool(getattr(parent, "supprime_pour_tous", 0)) if parent else False
-    extrait_parent = (
-        "Message supprimé" if parent_supprime else
-        ((parent.contenu or "")[:180] or ("Message vocal" if parent.piece_type == "audio" else parent.piece_nom or "Pièce jointe"))
-    ) if parent else None
-    return {
-        "id": message.id,
-        "auteur": message.auteur_username,
-        "auteur_nom": _nom_compte(db, message.auteur_username),
-        "contenu": "Ce message a été supprimé." if supprime else (message.contenu or ""),
-        "reply_to_id": message.reply_to_id,
-        "reply": ({"id": parent.id, "auteur": parent.auteur_username,
-                   "auteur_nom": _nom_compte(db, parent.auteur_username),
-                   "contenu": extrait_parent} if parent else None),
-        "style_texte": message.style_texte or "normal",
-        # Ne jamais exposer l'URL publique Cloudinary d'une pièce privée.
-        # Chaque client construit sa propre URL proxy avec son jeton de session.
-        "piece": ({"url": f"/api/classes/{classe_id}/discussion/messages/{message.id}/piece",
-                   "type": message.piece_type, "nom": message.piece_nom,
-                   "mime": message.piece_mime, "taille": message.piece_taille}
-                  if message.piece_url and not supprime else None),
-        "created_at": message.created_at.isoformat() if message.created_at else None,
-        "modifie": bool(getattr(message, "modifie", 0)) and not supprime,
-        "modifie_le": message.modifie_le.isoformat() if getattr(message, "modifie_le", None) else None,
-        "supprime_pour_tous": supprime,
-    }
+def _identites_comptes(db: Session, usernames: set[str]) -> dict[str, str]:
+    """Précharge les identités d'un lot pour éviter une requête par message/membre."""
+    if not usernames:
+        return {}
+    comptes = db.query(CompteGrind).filter(CompteGrind.username.in_(usernames)).all()
+    resultat = {}
+    for compte in comptes:
+        resultat[compte.username] = (
+            " ".join(x for x in [compte.prenom, compte.nom] if x).strip() or compte.username
+        )
+    return resultat
 
+def _serialiser_messages(db: Session, classe_id: int, messages: list[ClasseDiscussionMessage]) -> list[dict]:
+    if not messages:
+        return []
+    parent_ids = {int(m.reply_to_id) for m in messages if m.reply_to_id}
+    parents = db.query(ClasseDiscussionMessage).filter(ClasseDiscussionMessage.id.in_(parent_ids)).all() if parent_ids else []
+    parent_map = {p.id: p for p in parents}
+    usernames = {m.auteur_username for m in messages}
+    usernames.update(p.auteur_username for p in parents)
+    noms = _identites_comptes(db, usernames)
+    resultats = []
+    for message in messages:
+        supprime = bool(getattr(message, "supprime_pour_tous", 0))
+        parent = parent_map.get(message.reply_to_id) if message.reply_to_id else None
+        parent_supprime = bool(getattr(parent, "supprime_pour_tous", 0)) if parent else False
+        extrait_parent = (
+            "Message supprimé" if parent_supprime else
+            ((parent.contenu or "")[:180] or ("Message vocal" if parent.piece_type == "audio" else parent.piece_nom or "Pièce jointe"))
+        ) if parent else None
+        resultats.append({
+            "id": message.id, "auteur": message.auteur_username,
+            "client_message_id": getattr(message, "client_message_id", None),
+            "auteur_nom": noms.get(message.auteur_username, message.auteur_username),
+            "contenu": "Ce message a été supprimé." if supprime else (message.contenu or ""),
+            "reply_to_id": message.reply_to_id,
+            "reply": ({"id": parent.id, "auteur": parent.auteur_username,
+                       "auteur_nom": noms.get(parent.auteur_username, parent.auteur_username),
+                       "contenu": extrait_parent} if parent else None),
+            "style_texte": message.style_texte or "normal",
+            "piece": ({"url": f"/api/classes/{classe_id}/discussion/messages/{message.id}/piece",
+                       "type": message.piece_type, "nom": message.piece_nom,
+                       "mime": message.piece_mime, "taille": message.piece_taille}
+                      if message.piece_url and not supprime else None),
+            "created_at": message.created_at.isoformat() if message.created_at else None,
+            "modifie": bool(getattr(message, "modifie", 0)) and not supprime,
+            "modifie_le": message.modifie_le.isoformat() if getattr(message, "modifie_le", None) else None,
+            "supprime_pour_tous": supprime,
+        })
+    return resultats
+
+def _serialiser_message(db: Session, classe_id: int, message: ClasseDiscussionMessage) -> dict:
+    return _serialiser_messages(db, classe_id, [message])[0]
+
+
+def _creer_notifications_message(db: Session, classe: Classe, discussion: ClasseDiscussion,
+                                 message: ClasseDiscussionMessage, auteur: str, extrait: str,
+                                 exclus: set[str] | None = None):
+    exclus = set(exclus or ()) | {auteur}
+    usernames = [row[0] for row in db.query(ClasseDiscussionMembre.username).filter_by(
+        discussion_id=discussion.id, actif=1
+    ).all() if row[0] not in exclus]
+    notifications = []
+    for cible in usernames:
+        notification = NotificationGrind(
+            destinataire_username=cible, acteur_username=auteur, type="message_classe",
+            resource_type="classe_discussion_message", resource_id=message.id,
+            classe_id=classe.id, extrait=(extrait or "Nouveau message")[:180],
+        )
+        db.add(notification)
+        notifications.append(notification)
+    return notifications
+
+
+async def _diffuser_notifications_discussion(db: Session, notifications):
+    """Diffuse les notifications persistées sans requête SQL par destinataire."""
+    lignes = list(notifications or [])
+    if not lignes:
+        return
+    usernames = {n.acteur_username for n in lignes if n.acteur_username}
+    noms = _identites_comptes(db, usernames)
+    for notification in lignes:
+        await manager.notifier_utilisateur(notification.destinataire_username, {
+            "type": "persistante", "id": f"notification-{notification.id}",
+            "notificationId": notification.id, "eventType": notification.type,
+            "acteur": notification.acteur_username,
+            "acteur_nom": noms.get(notification.acteur_username, notification.acteur_username),
+            "resource_type": notification.resource_type, "resource_id": notification.resource_id,
+            "classe_id": notification.classe_id, "extrait": notification.extrait, "lu": False,
+        })
+
+
+def _serialiser_membres(db: Session, classe_id: int, membres: list[ClasseDiscussionMembre]) -> list[dict]:
+    if not membres:
+        return []
+    usernames = {m.username for m in membres}
+    noms = _identites_comptes(db, usernames)
+    membres_classe = {row[0] for row in db.query(ClasseMembre.username).filter(
+        ClasseMembre.classe_id == classe_id, ClasseMembre.username.in_(usernames)
+    ).all()}
+    return [{
+        "username": m.username, "nom": noms.get(m.username, m.username), "role": m.role,
+        "restreint": bool(m.restreint),
+        "restriction_jusqua": m.restriction_jusqua.isoformat() if m.restriction_jusqua else None,
+        "est_en_classe": m.username in membres_classe,
+    } for m in membres]
 
 def _serialiser_membre(db: Session, classe_id: int, membre: ClasseDiscussionMembre) -> dict:
-    return {
-        "username": membre.username,
-        "nom": _nom_compte(db, membre.username),
-        "role": membre.role,
-        "restreint": bool(membre.restreint),
-        "restriction_jusqua": membre.restriction_jusqua.isoformat() if membre.restriction_jusqua else None,
-        "est_en_classe": db.query(ClasseMembre.id).filter_by(
-            classe_id=classe_id, username=membre.username
-        ).first() is not None,
-    }
+    return _serialiser_membres(db, classe_id, [membre])[0]
 
-
-def _verifier_piece(piece: dict | None):
+def _verifier_piece(piece: dict | None, db: Session | None = None, username: str | None = None):
     if not piece:
         return None
     url = str(piece.get("url") or "").strip()
@@ -166,14 +234,36 @@ def _verifier_piece(piece: dict | None):
     except (TypeError, ValueError):
         taille = 0
     parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
+    if (parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com"
+            or parsed.port not in (None, 443) or not CLOUDINARY_CLOUD_NAME
+            or parsed.path.strip("/").split("/", 1)[0] != CLOUDINARY_CLOUD_NAME):
         raise HTTPException(status_code=400, detail="La pièce jointe doit provenir du stockage GRIND.")
     limites = {"image": ("/image/upload/", 25), "video": ("/video/upload/", 300), "audio": ("/video/upload/", 8), "document": ("/raw/upload/", 15)}
     if genre not in limites:
         raise HTTPException(status_code=400, detail="Type de pièce jointe non accepté.")
     chemin, max_mo = limites[genre]
-    if chemin not in parsed.path or taille <= 0 or taille > max_mo * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"La pièce jointe est invalide ou dépasse {max_mo} Mo.")
+    if chemin not in parsed.path:
+        raise HTTPException(status_code=400, detail="Le type de ressource Cloudinary ne correspond pas à la pièce jointe.")
+    if db is None:
+        if taille <= 0 or taille > max_mo * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"La pièce jointe est invalide ou dépasse {max_mo} Mo.")
+    # Accepter uniquement les espaces GRIND prévus par les endpoints d'upload.
+    # Le nom du cloud seul ne suffit pas : un autre public_id du même compte
+    # ne doit pas pouvoir être attaché arbitrairement à une discussion.
+    segments = parsed.path.strip("/").split("/")
+    version_index = next((i for i, segment in enumerate(segments[3:], start=3)
+                          if re.fullmatch(r"v[0-9]+", segment)), None)
+    if version_index is None or version_index >= len(segments) - 1:
+        raise HTTPException(status_code=400, detail="La référence Cloudinary n'est pas complète.")
+    public_id = "/".join(segments[version_index + 1:])
+    dossier_attendu = {
+        "image": ("grind_posts/",),
+        "video": ("grind_posts/",),
+        "document": ("grind_documents/",),
+        "audio": ("grind_discussion_audio/",),
+    }
+    if not public_id.startswith(dossier_attendu[genre]):
+        raise HTTPException(status_code=400, detail="Ce fichier ne provient pas d'un espace de stockage média GRIND autorisé.")
     extension = nom.rsplit(".", 1)[-1].lower() if "." in nom else ""
     extensions = {
         "image": {"jpg", "jpeg", "png", "webp"},
@@ -185,7 +275,38 @@ def _verifier_piece(piece: dict | None):
         raise HTTPException(status_code=415, detail="Extension de pièce jointe non prise en charge.")
     if genre == "audio" and not mime.startswith("audio/"):
         raise HTTPException(status_code=415, detail="Le message vocal doit être un fichier audio valide.")
+    if db is not None:
+        if not username:
+            raise HTTPException(status_code=401, detail="Compte GRIND requis pour joindre ce média.")
+        from media_assets import verifier_proprietaire_media
+        asset = verifier_proprietaire_media(db, username=username, url=url)
+        taille = int(asset.size_bytes or 0)
+        mime_asset = str(asset.mime_type or "").lower()
+        if taille <= 0 or taille > max_mo * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"La pièce jointe dépasse la limite de {max_mo} Mo.")
+        mime_autorises = {
+            "image": {"image/jpeg", "image/png", "image/webp"},
+            "video": {"video/mp4", "video/quicktime", "video/webm"},
+            "audio": {"audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg"},
+            "document": {"application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+        }
+        if mime_asset not in mime_autorises[genre]:
+            raise HTTPException(status_code=415, detail="Le type réel du fichier ne correspond pas à cette pièce jointe.")
+        if mime and mime.lower() != mime_asset:
+            raise HTTPException(status_code=415, detail="Le type de fichier déclaré ne correspond pas au fichier stocké.")
+        mime = mime_asset
     return {"url": url, "type": genre, "nom": nom, "mime": mime, "taille": taille}
+
+
+def _message_est_masque(db: Session, username: str, message_id: int) -> bool:
+    return db.query(ClasseDiscussionMessageMasque.id).filter_by(
+        username=username, message_id=message_id
+    ).first() is not None
+
+
+def _exiger_message_visible(db: Session, username: str, message_id: int) -> None:
+    if _message_est_masque(db, username, message_id):
+        raise HTTPException(status_code=404, detail="Message introuvable.")
 
 
 def _restriction_active(db: Session, membre: ClasseDiscussionMembre) -> bool:
@@ -242,8 +363,8 @@ async def obtenir_discussion(classe_id: int, session_token: str, db: Session = D
             "code_classe": classe.code_invitation,
             "nom_classe": classe.nom,
         },
-        "membres": [_serialiser_membre(db, classe.id, m) for m in membres],
-        "messages": [_serialiser_message(db, classe.id, m) for m in reversed(messages)],
+        "membres": _serialiser_membres(db, classe.id, membres),
+        "messages": _serialiser_messages(db, classe.id, list(reversed(messages))),
     }
 
 
@@ -269,13 +390,70 @@ async def lister_messages(classe_id: int, session_token: str, before_id: int | N
     else:
         rows = q.order_by(ClasseDiscussionMessage.id.desc()).limit(limite).all()
         rows = list(reversed(rows))
-    return {"messages": [_serialiser_message(db, classe.id, m) for m in rows], "has_more": len(rows) == limite}
+    return {"messages": _serialiser_messages(db, classe.id, rows), "has_more": len(rows) == limite}
 
+
+@router.post("/api/classes/{classe_id}/discussion/media-tickets")
+async def creer_tickets_media_discussion(classe_id: int, data: dict, db: Session = Depends(get_db)):
+    """Émet des URL temporaires limitées aux pièces des messages demandés."""
+    username = _identite(data.get("session_token", ""), db)
+    classe, discussion = _classe_et_discussion(db, classe_id)
+    _membre(db, discussion.id, username)
+    ids_bruts = data.get("message_ids") or []
+    if not isinstance(ids_bruts, list) or len(ids_bruts) > MAX_PAGE:
+        raise HTTPException(status_code=400, detail="La liste des médias demandés est invalide.")
+    ids = []
+    for valeur in ids_bruts:
+        try:
+            identifiant = int(valeur)
+        except (TypeError, ValueError):
+            continue
+        if identifiant > 0 and identifiant not in ids:
+            ids.append(identifiant)
+    masques = {row[0] for row in db.query(ClasseDiscussionMessageMasque.message_id).filter(
+        ClasseDiscussionMessageMasque.username == username,
+        ClasseDiscussionMessageMasque.message_id.in_(ids),
+    ).all()} if ids else set()
+    messages = db.query(ClasseDiscussionMessage).filter(
+        ClasseDiscussionMessage.discussion_id == discussion.id,
+        ClasseDiscussionMessage.id.in_(ids),
+        ClasseDiscussionMessage.piece_url.isnot(None),
+        ClasseDiscussionMessage.supprime_pour_tous != 1,
+        ~ClasseDiscussionMessage.id.in_(masques or [-1]),
+    ).all() if ids else []
+    resultats = {}
+    for message in messages:
+        ticket = creer_ticket_media(
+            db, username=username, resource_type="discussion", resource_id=message.id,
+            container_id=classe_id, purpose="read", duree=3600,
+        )
+        base = f"/api/classes/{classe_id}/discussion/messages/{message.id}/piece?ticket={ticket}"
+        resultats[str(message.id)] = {"url": base, "poster_url": base + "&poster=1" if message.piece_type == "video" else None}
+    db.commit()
+    return {"tickets": resultats, "expires_in": 3600}
+
+@router.post("/api/classes/{classe_id}/discussion/messages/{message_id}/media-ticket")
+async def creer_ticket_media_discussion(classe_id: int, message_id: int, data: dict, db: Session = Depends(get_db)):
+    username = _identite(data.get("session_token", ""), db)
+    classe, discussion = _classe_et_discussion(db, classe_id)
+    _membre(db, discussion.id, username)
+    message = db.query(ClasseDiscussionMessage).filter_by(id=message_id, discussion_id=discussion.id).first()
+    if message is None or not message.piece_url or bool(getattr(message, "supprime_pour_tous", 0)):
+        raise HTTPException(status_code=404, detail="Pièce jointe introuvable.")
+    _exiger_message_visible(db, username, message.id)
+    purpose = "download" if bool(data.get("download")) else "read"
+    ticket = creer_ticket_media(db, username=username, resource_type="discussion", resource_id=message.id,
+                                container_id=classe_id, purpose=purpose, duree=300 if purpose == "download" else 3600)
+    db.commit()
+    url = f"/api/classes/{classe_id}/discussion/messages/{message.id}/piece?ticket={ticket}"
+    if purpose == "download":
+        url += "&download=1"
+    return {"url": url, "expires_in": 300 if purpose == "download" else 3600}
 
 @router.get("/api/classes/{classe_id}/discussion/messages/{message_id}/piece")
 async def obtenir_piece_message(
-    classe_id: int, message_id: int, request: Request, session_token: str,
-    db: Session = Depends(get_db),
+    classe_id: int, message_id: int, request: Request, session_token: str | None = None,
+    ticket: str | None = None, db: Session = Depends(get_db),
     download: bool = False,
     poster: bool = False,
 ):
@@ -285,14 +463,24 @@ async def obtenir_piece_message(
     public Cloudinary renvoie 401, le serveur génère une URL API signée à durée
     courte et la consomme lui-même. Le lien et les secrets ne quittent jamais GRIND.
     """
-    username = _identite(session_token, db)
+    purpose = "download" if download else "read"
+    if ticket:
+        autorisation = verifier_ticket_media(
+            db, ticket, resource_type="discussion", resource_id=message_id,
+            container_id=classe_id, purpose=purpose,
+        )
+        username = autorisation.username
+    else:
+        # Compatibilité avec les anciennes versions : les nouvelles URLs utilisent ticket=.
+        username = _identite(session_token or "", db)
     classe, discussion = _classe_et_discussion(db, classe_id)
     _membre(db, discussion.id, username)
     message = db.query(ClasseDiscussionMessage).filter_by(
         id=message_id, discussion_id=discussion.id
     ).first()
-    if message is None or not message.piece_url:
+    if message is None or not message.piece_url or bool(getattr(message, "supprime_pour_tous", 0)):
         raise HTTPException(status_code=404, detail="Pièce jointe introuvable.")
+    _exiger_message_visible(db, username, message.id)
 
     media_poster = False
     source_url = message.piece_url
@@ -305,7 +493,9 @@ async def obtenir_piece_message(
         media_poster = True
 
     parsed = urlparse(source_url)
-    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
+    if (parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com"
+            or parsed.port not in (None, 443) or not CLOUDINARY_CLOUD_NAME
+            or parsed.path.strip("/").split("/", 1)[0] != CLOUDINARY_CLOUD_NAME):
         raise HTTPException(status_code=502, detail="La pièce jointe n'est pas disponible pour le moment.")
 
     entetes = {"Accept-Encoding": "identity", "Accept": "image/jpeg" if media_poster else "*/*"}
@@ -409,10 +599,11 @@ async def obtenir_piece_message(
 
 @router.post("/api/classes/{classe_id}/discussion/vocaux")
 async def envoyer_vocal_discussion(
-    classe_id: int,
+    classe_id: int, background_tasks: BackgroundTasks,
     session_token: str = Form(...),
     file: UploadFile = File(...),
     reply_to_id: int | None = Form(None),
+    client_message_id: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
     """Stocke le vocal sur Cloudinary (pas dans SQL), puis publie son message."""
@@ -421,6 +612,15 @@ async def envoyer_vocal_discussion(
     membre = _membre(db, discussion.id, username)
     if _restriction_active(db, membre):
         raise HTTPException(status_code=403, detail="Tu ne peux pas envoyer de message pour le moment.")
+    client_message_id = str(client_message_id or "").strip()[:64]
+    if client_message_id:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{12,64}", client_message_id):
+            raise HTTPException(status_code=400, detail="Identifiant de message invalide.")
+        existant = db.query(ClasseDiscussionMessage).filter_by(
+            discussion_id=discussion.id, auteur_username=username, client_message_id=client_message_id
+        ).first()
+        if existant is not None:
+            return {"success": True, "message": _serialiser_message(db, classe.id, existant), "duplicate": True}
 
     nom, mime, taille = _informations_fichier(file, "audio", MAX_VOCAL_OCTETS)
     params = {
@@ -433,9 +633,15 @@ async def envoyer_vocal_discussion(
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com" or "/video/upload/" not in parsed.path:
         raise HTTPException(status_code=502, detail="Le stockage n'a pas retourné un fichier vocal exploitable.")
+    from media_assets import enregistrer_media_asset
+    enregistrer_media_asset(
+        db, username=username, url=url, mime_type=mime,
+        size_bytes=int(resultat.get("bytes") or taille),
+    )
+    db.flush()
     piece = _verifier_piece({
         "url": url, "type": "audio", "nom": nom, "mime": mime, "taille": taille,
-    })
+    }, db=db, username=username)
 
     parent = None
     if reply_to_id is not None:
@@ -454,13 +660,26 @@ async def envoyer_vocal_discussion(
         piece_nom=piece["nom"],
         piece_mime=piece["mime"],
         piece_taille=piece["taille"],
+        client_message_id=client_message_id or None,
     )
     db.add(message)
-    db.flush()
+    try:
+        db.flush()
+    except Exception as flush_error:
+        from sqlalchemy.exc import IntegrityError
+        db.rollback()
+        if client_message_id and isinstance(flush_error, IntegrityError):
+            existant = db.query(ClasseDiscussionMessage).filter_by(
+                discussion_id=discussion.id, auteur_username=username, client_message_id=client_message_id
+            ).first()
+            if existant is not None:
+                return {"success": True, "message": _serialiser_message(db, classe.id, existant), "duplicate": True}
+        raise
     notifications = _creer_notifications_message(db, classe, discussion, message, username, "Message vocal")
     db.commit()
-    await envoyer_notifications_push(db, notifications)
     await _diffuser_notifications_discussion(db, notifications)
+    if notifications:
+        background_tasks.add_task(envoyer_notifications_push_par_ids, [n.id for n in notifications if n.id])
     db.refresh(message)
     payload = _serialiser_message(db, classe.id, message)
     await manager.diffuser_discussion(discussion.id, {"type": "message", "message": payload})
@@ -468,7 +687,7 @@ async def envoyer_vocal_discussion(
 
 
 @router.post("/api/classes/{classe_id}/discussion/messages")
-async def envoyer_message(classe_id: int, data: dict, db: Session = Depends(get_db)):
+async def envoyer_message(classe_id: int, data: dict, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     username = _identite(data.get("session_token", ""), db)
     classe, discussion = _classe_et_discussion(db, classe_id)
     membre = _membre(db, discussion.id, username)
@@ -477,7 +696,16 @@ async def envoyer_message(classe_id: int, data: dict, db: Session = Depends(get_
     contenu = str(data.get("contenu") or "").strip()
     if len(contenu) > MAX_MESSAGE:
         raise HTTPException(status_code=400, detail=f"Un message ne peut pas dépasser {MAX_MESSAGE} caractères.")
-    piece = _verifier_piece(data.get("piece"))
+    piece = _verifier_piece(data.get("piece"), db=db, username=username)
+    client_message_id = str(data.get("client_message_id") or "").strip()[:64]
+    if client_message_id:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{12,64}", client_message_id):
+            raise HTTPException(status_code=400, detail="Identifiant de message invalide.")
+        deja_envoye = db.query(ClasseDiscussionMessage).filter_by(
+            discussion_id=discussion.id, auteur_username=username, client_message_id=client_message_id
+        ).first()
+        if deja_envoye is not None:
+            return {"success": True, "message": _serialiser_message(db, classe.id, deja_envoye), "duplicate": True}
     if not contenu and not piece:
         raise HTTPException(status_code=400, detail="Écris un message ou ajoute une pièce jointe.")
     style = str(data.get("style_texte") or "normal")
@@ -498,21 +726,37 @@ async def envoyer_message(classe_id: int, data: dict, db: Session = Depends(get_
         piece_nom=piece["nom"] if piece else None,
         piece_mime=piece["mime"] if piece else None,
         piece_taille=piece["taille"] if piece else None,
+        client_message_id=client_message_id or None,
     )
     db.add(message)
-    db.flush()
+    try:
+        db.flush()
+    except Exception as flush_error:
+        from sqlalchemy.exc import IntegrityError
+        db.rollback()
+        if client_message_id and isinstance(flush_error, IntegrityError):
+            deja_envoye = db.query(ClasseDiscussionMessage).filter_by(
+                discussion_id=discussion.id, auteur_username=username, client_message_id=client_message_id
+            ).first()
+            if deja_envoye is not None:
+                return {"success": True, "message": _serialiser_message(db, classe.id, deja_envoye), "duplicate": True}
+        raise
 
     destinataires = []
     usernames_mentionnes = set()
-    for pseudo in dict.fromkeys(re.findall(r"(?<![A-Za-z0-9_])@([A-Za-z_]{3,24})", contenu)):
-        compte = db.query(CompteGrind).filter(func.lower(CompteGrind.username) == pseudo.lower()).first()
-        if not compte or compte.username == username:
-            continue
-        membre_cible = db.query(ClasseDiscussionMembre).filter_by(
-            discussion_id=discussion.id, username=compte.username
-        ).first()
-        if not membre_cible:
-            continue  # un tag n'accorde jamais l'accès à un groupe privé
+    pseudos = list(dict.fromkeys(pseudo.lower() for pseudo in re.findall(r"(?<![A-Za-z0-9_])@([A-Za-z_]{3,24})", contenu)))
+    comptes_mentionnes = db.query(CompteGrind).filter(func.lower(CompteGrind.username).in_(pseudos)).all() if pseudos else []
+    comptes_par_pseudo = {compte.username.lower(): compte for compte in comptes_mentionnes}
+    membres_cibles = db.query(ClasseDiscussionMembre.username).filter(
+        ClasseDiscussionMembre.discussion_id == discussion.id,
+        ClasseDiscussionMembre.actif == 1,
+        ClasseDiscussionMembre.username.in_([c.username for c in comptes_mentionnes]),
+    ).all() if comptes_mentionnes else []
+    membres_cibles_set = {row[0] for row in membres_cibles}
+    for pseudo in pseudos:
+        compte = comptes_par_pseudo.get(pseudo)
+        if not compte or compte.username == username or compte.username not in membres_cibles_set:
+            continue  # une mention ne donne jamais accès au groupe privé
         db.add(ClasseDiscussionMention(message_id=message.id, username=compte.username))
         usernames_mentionnes.add(compte.username)
         notification = NotificationGrind(
@@ -531,9 +775,21 @@ async def envoyer_message(classe_id: int, data: dict, db: Session = Depends(get_
     notifications_generiques = _creer_notifications_message(
         db, classe, discussion, message, username, contenu[:180] or "Nouveau message", usernames_mentionnes
     )
-    db.commit()
-    await envoyer_notifications_push(db, notifications_mentions + notifications_generiques)
+    try:
+        db.commit()
+    except Exception as commit_error:
+        from sqlalchemy.exc import IntegrityError
+        db.rollback()
+        if client_message_id and isinstance(commit_error, IntegrityError):
+            deja_envoye = db.query(ClasseDiscussionMessage).filter_by(
+                discussion_id=discussion.id, auteur_username=username, client_message_id=client_message_id
+            ).first()
+            if deja_envoye is not None:
+                return {"success": True, "message": _serialiser_message(db, classe.id, deja_envoye), "duplicate": True}
+        raise
     await _diffuser_notifications_discussion(db, notifications_generiques)
+    if notifications_mentions or notifications_generiques:
+        background_tasks.add_task(envoyer_notifications_push_par_ids, [n.id for n in notifications_mentions + notifications_generiques if n.id])
     db.refresh(message)
     payload = _serialiser_message(db, classe.id, message)
     await manager.diffuser_discussion(discussion.id, {"type": "message", "message": payload})
@@ -641,13 +897,9 @@ async def lister_membres(classe_id: int, session_token: str, q: str = "", db: Se
     _membre(db, discussion.id, username)
     membres = db.query(ClasseDiscussionMembre).filter_by(discussion_id=discussion.id, actif=1).all()
     terme = (q or "").strip().lstrip("@").lower()
-    resultat = []
-    for m in membres:
-        compte = db.get(CompteGrind, m.username)
-        nom = _nom_compte(db, m.username)
-        if terme and terme not in m.username.lower() and terme not in nom.lower():
-            continue
-        resultat.append({"username": m.username, "nom": nom, "role": m.role})
+    resultat = _serialiser_membres(db, classe.id, membres)
+    if terme:
+        resultat = [m for m in resultat if terme in m["username"].lower() or terme in m["nom"].lower()]
     resultat.sort(key=lambda x: (0 if x["role"] == "owner" else 1 if x["role"] == "admin" else 2, x["nom"].lower()))
     return {"membres": resultat[:30]}
 
@@ -664,9 +916,10 @@ async def lister_mentions(classe_id: int, session_token: str, db: Session = Depe
         ClasseDiscussionMention.lu == 0,
         ClasseDiscussionMessage.discussion_id == discussion.id,
     ).order_by(ClasseDiscussionMention.id.asc()).all()
+    noms = _identites_comptes(db, {msg.auteur_username for _, msg in rows})
     return {"mentions": [{
         "id": mention.id, "message_id": msg.id, "auteur": msg.auteur_username,
-        "auteur_nom": _nom_compte(db, msg.auteur_username),
+        "auteur_nom": noms.get(msg.auteur_username, msg.auteur_username),
         "extrait": msg.contenu[:180], "created_at": msg.created_at.isoformat() if msg.created_at else None,
     } for mention, msg in rows]}
 

@@ -6,7 +6,7 @@ Les colonnes historiques liées à G-SOCIETY restent conservées pour ne pas
 casser les comptes créés avant la migration.
 """
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.sql import func
 from database import Base
 
@@ -557,6 +557,7 @@ class ClasseDiscussionMembre(Base):
 class ClasseDiscussionMessage(Base):
     """Message persistant du groupe de classe."""
     __tablename__ = "classe_discussion_messages"
+    __table_args__ = (Index("uq_discussion_client_message_id", "discussion_id", "auteur_username", "client_message_id", unique=True),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     discussion_id = Column(Integer, ForeignKey("classe_discussions.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -569,6 +570,7 @@ class ClasseDiscussionMessage(Base):
     piece_nom = Column(String(180), nullable=True)
     piece_mime = Column(String(120), nullable=True)
     piece_taille = Column(Integer, nullable=True)
+    client_message_id = Column(String(64), nullable=True)
     modifie = Column(Integer, nullable=True, default=0)
     modifie_le = Column(DateTime(timezone=True), nullable=True)
     # Colonne nullable pour que la migration légère puisse l'ajouter aux bases existantes.
@@ -596,4 +598,37 @@ class ClasseDiscussionMention(Base):
     message_id = Column(Integer, ForeignKey("classe_discussion_messages.id", ondelete="CASCADE"), nullable=False, index=True)
     username = Column(String(64), nullable=False, index=True)
     lu = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+
+class GrindMediaAsset(Base):
+    """Registre des fichiers Cloudinary confirmés par GRIND et de leur propriétaire."""
+    __tablename__ = "grind_media_assets"
+    __table_args__ = (Index("ix_grind_media_asset_owner", "username", "created_at"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    asset_key = Column(String(64), nullable=False, unique=True, index=True)
+    username = Column(String(64), ForeignKey("comptes_grind.username"), nullable=False, index=True)
+    resource_type = Column(String(16), nullable=False)
+    public_id = Column(String(255), nullable=False)
+    version = Column(String(32), nullable=False)
+    mime_type = Column(String(120), nullable=True)
+    size_bytes = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class GrindMediaAccessTicket(Base):
+    """Ticket temporaire, limité à une ressource média et à une opération."""
+    __tablename__ = "grind_media_access_tickets"
+    __table_args__ = (Index("ix_grind_media_ticket_expiry", "expires_at"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    username = Column(String(64), ForeignKey("comptes_grind.username"), nullable=False, index=True)
+    resource_type = Column(String(24), nullable=False, index=True)
+    resource_id = Column(Integer, nullable=False, index=True)
+    container_id = Column(Integer, nullable=True, index=True)
+    purpose = Column(String(32), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

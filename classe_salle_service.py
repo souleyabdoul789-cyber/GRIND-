@@ -19,9 +19,13 @@ def professeur_actuel(classe, membres=None):
     return ancien_prof or classe.createur_username
 
 
-def assurer_prof_et_sieges(db, classe):
-    """Répare progressivement les classes historiques sans changer leur capacité."""
-    membres = db.query(ClasseMembre).filter_by(classe_id=classe.id).order_by(ClasseMembre.id.asc()).all()
+def assurer_prof_et_sieges(db, classe, membres=None):
+    """Répare progressivement les classes historiques sans changer leur capacité.
+
+    `membres` peut être préchargé par lots par les routes de liste pour éviter
+    une requête SQL supplémentaire par classe.
+    """
+    membres = list(membres) if membres is not None else db.query(ClasseMembre).filter_by(classe_id=classe.id).order_by(ClasseMembre.id.asc()).all()
     prof = professeur_actuel(classe, membres)
     if getattr(classe, "prof_username", None) != prof:
         classe.prof_username = prof

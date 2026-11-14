@@ -17,13 +17,16 @@ def url_privee_telechargement_raw(source: str, extensions_autorisees: set[str]) 
     L'URL signée ne doit jamais être renvoyée au client ni journalisée.
     """
     parsed = urlparse(source or "")
-    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com":
+    if parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com" or parsed.port not in (None, 443):
         return None
     if not all((CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET)):
         return None
 
     parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
-    if len(parts) < 5 or parts[0] != CLOUDINARY_CLOUD_NAME or parts[1:3] != ["raw", "upload"]:
+    if len(parts) < 5 or parts[0] != CLOUDINARY_CLOUD_NAME or parts[1:3] not in (["raw", "upload"], ["raw", "private"], ["raw", "authenticated"]):
+        return None
+    delivery_type = parts[2]
+    if any(part in (".", "..") or "/" in part or "\\" in part for part in parts):
         return None
     version_index = next(
         (index for index, part in enumerate(parts[3:], start=3)
@@ -44,7 +47,7 @@ def url_privee_telechargement_raw(source: str, extensions_autorisees: set[str]) 
             public_id,
             extension,
             resource_type="raw",
-            type="upload",
+            type=delivery_type,
             expires_at=int(time.time()) + 180,
             attachment=True,
             cloud_name=CLOUDINARY_CLOUD_NAME,
