@@ -5,6 +5,7 @@ messages est une entité séparée, plafonnée à 200 membres, et peut donc incl
 des personnes qui ne prennent pas de siège dans la classe réelle.
 """
 from datetime import datetime, timedelta, timezone
+import asyncio
 import logging
 import hashlib
 import re
@@ -200,22 +201,29 @@ def _creer_notifications_message(db: Session, classe: Classe, discussion: Classe
     return notifications
 
 
-async def _diffuser_notifications_discussion(db: Session, notifications):
-    """Diffuse les notifications persistées sans requête SQL par destinataire."""
+def _preparer_notifications_discussion(db: Session, notifications):
+    """Construit les payloads avant fermeture de la session SQLAlchemy."""
     lignes = list(notifications or [])
     if not lignes:
-        return
-    usernames = {n.acteur_username for n in lignes if n.acteur_username}
+        return []
+    usernames = {notification.acteur_username for notification in lignes if notification.acteur_username}
     noms = _identites_comptes(db, usernames)
-    for notification in lignes:
-        await manager.notifier_utilisateur(notification.destinataire_username, {
-            "type": "persistante", "id": f"notification-{notification.id}",
-            "notificationId": notification.id, "eventType": notification.type,
-            "acteur": notification.acteur_username,
-            "acteur_nom": noms.get(notification.acteur_username, notification.acteur_username),
-            "resource_type": notification.resource_type, "resource_id": notification.resource_id,
-            "classe_id": notification.classe_id, "extrait": notification.extrait, "lu": False,
-        })
+    return [(notification.destinataire_username, {
+        "type": "persistante", "id": f"notification-{notification.id}",
+        "notificationId": notification.id, "eventType": notification.type,
+        "acteur": notification.acteur_username,
+        "acteur_nom": noms.get(notification.acteur_username, notification.acteur_username),
+        "resource_type": notification.resource_type, "resource_id": notification.resource_id,
+        "classe_id": notification.classe_id, "extrait": notification.extrait, "lu": False,
+    }) for notification in lignes]
+
+
+async def _diffuser_notifications_discussion(evenements):
+    """Diffuse les payloads déjà préparés, en parallèle, hors requête SQL."""
+    if evenements:
+        await asyncio.gather(*(manager.notifier_utilisateur(username, payload)
+                               for username, payload in evenements))
+
 
 
 def _serialiser_membres(db: Session, classe_id: int, membres: list[ClasseDiscussionMembre]) -> list[dict]:
@@ -726,12 +734,14 @@ async def envoyer_vocal_discussion(
         raise
     notifications = _creer_notifications_message(db, classe, discussion, message, username, "Message vocal")
     db.commit()
-    await _diffuser_notifications_discussion(db, notifications)
-    if notifications:
-        background_tasks.add_task(envoyer_notifications_push_par_ids, [n.id for n in notifications if n.id])
     db.refresh(message)
     payload = _serialiser_message(db, classe.id, message)
     await manager.diffuser_discussion(discussion.id, {"type": "message", "message": payload})
+    evenements = _preparer_notifications_discussion(db, notifications)
+    if evenements:
+        background_tasks.add_task(_diffuser_notifications_discussion, evenements)
+    if notifications:
+        background_tasks.add_task(envoyer_notifications_push_par_ids, [n.id for n in notifications if n.id])
     return {"success": True, "message": payload}
 
 
@@ -836,20 +846,24 @@ async def envoyer_message(classe_id: int, data: dict, background_tasks: Backgrou
             if deja_envoye is not None:
                 return {"success": True, "message": _serialiser_message(db, classe.id, deja_envoye), "duplicate": True}
         raise
-    await _diffuser_notifications_discussion(db, notifications_generiques)
-    if notifications_mentions or notifications_generiques:
-        background_tasks.add_task(envoyer_notifications_push_par_ids, [n.id for n in notifications_mentions + notifications_generiques if n.id])
     db.refresh(message)
     payload = _serialiser_message(db, classe.id, message)
     await manager.diffuser_discussion(discussion.id, {"type": "message", "message": payload})
-    for cible, notification in destinataires:
-        await manager.notifier_utilisateur(cible, {
+    evenements = _preparer_notifications_discussion(db, notifications_generiques)
+    if evenements:
+        background_tasks.add_task(_diffuser_notifications_discussion, evenements)
+    if notifications_mentions or notifications_generiques:
+        background_tasks.add_task(envoyer_notifications_push_par_ids, [n.id for n in notifications_mentions + notifications_generiques if n.id])
+    if destinataires:
+        acteur_nom = _nom_compte(db, username)
+        evenements_mentions = [(cible, {
             "type": "persistante", "id": f"notification-{notification.id}",
             "notificationId": notification.id, "eventType": "mention_classe",
-            "acteur": username, "acteur_nom": _nom_compte(db, username),
-            "resource_type": "classe_discussion_message", "resource_id": message.id,
+            "acteur": username, "acteur_nom": acteur_nom,
+            "resource_type": notification.resource_type, "resource_id": message.id,
             "classe_id": classe.id, "extrait": payload["contenu"][:180], "lu": False,
-        })
+        }) for cible, notification in destinataires]
+        background_tasks.add_task(_diffuser_notifications_discussion, evenements_mentions)
     return {"success": True, "message": payload}
 
 

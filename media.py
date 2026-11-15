@@ -38,6 +38,7 @@ POIDS_MAX_VIDEO_MO = 300
 SEUIL_CHUNK_CLOUDINARY_OCTETS = 90 * 1024 * 1024
 TAILLE_CHUNK_CLOUDINARY_OCTETS = 20 * 1024 * 1024  # Cloudinary exige > 5 Mo sauf dernier chunk
 POIDS_MAX_DOCUMENT_MO = 15
+POIDS_MAX_VOCAL_MO = 8
 WATERMARK = "l_grind_watermark,g_south_east,x_24,y_24,fl_layer_apply"
 
 IMAGES = {
@@ -239,13 +240,17 @@ async def signer_upload_media(data: dict, db: Session = Depends(get_db)):
         taille = int(taille)
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Taille du fichier invalide.")
-    groupe = "video" if extension in VIDEOS else "image" if extension in IMAGES else None
+    # .webm existe en vidéo et en audio : le MIME du MediaRecorder tranche.
+    groupe = ("audio" if extension in AUDIO and mime_declare.startswith("audio/")
+              else "video" if extension in VIDEOS else "image" if extension in IMAGES
+              else "audio" if extension in AUDIO else None)
     if not groupe:
         raise HTTPException(status_code=415, detail="Format média non accepté.")
-    limite_mo = POIDS_MAX_VIDEO_MO if groupe == "video" else POIDS_MAX_IMAGE_MO
+    limite_mo = POIDS_MAX_VIDEO_MO if groupe == "video" else POIDS_MAX_IMAGE_MO if groupe == "image" else POIDS_MAX_VOCAL_MO
     if taille <= 0 or taille > limite_mo * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"Le fichier ne doit pas dépasser {limite_mo} Mo.")
-    mime_attendu = (VIDEOS if groupe == "video" else IMAGES)[extension][0]
+    catalogue_mime = VIDEOS if groupe == "video" else IMAGES if groupe == "image" else AUDIO
+    mime_attendu = catalogue_mime[extension][0]
     if mime_declare and mime_declare not in (mime_attendu, "application/octet-stream"):
         raise HTTPException(status_code=415, detail="Le type MIME ne correspond pas au format du fichier.")
     debut_video = data.get("debut_video")
@@ -257,13 +262,22 @@ async def signer_upload_media(data: dict, db: Session = Depends(get_db)):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Une découpe vidéo valide est requise.")
         _valider_decoupe_video(debut_video, fin_video)
-    params = _parametres_upload_media(groupe, debut_video, fin_video)
-    # Un identifiant unique évite d'écraser une publication déjà envoyée sous le même nom.
-    params["public_id"] = uuid.uuid4().hex
+    if groupe == "audio":
+        params = {
+            "folder": "grind_discussion_audio",
+            "public_id": uuid.uuid4().hex,
+            "allowed_formats": "webm,ogg,m4a,mp3",
+        }
+        ressource = "video"
+    else:
+        params = _parametres_upload_media(groupe, debut_video, fin_video)
+        params["public_id"] = uuid.uuid4().hex
+        ressource = "video" if groupe == "video" else "image"
     _, donnees = _donnees_signature_cloudinary(params)
     return {
-        "upload_url": f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/{ 'video' if groupe == 'video' else 'image' }/upload",
-        "resource_type": "video" if groupe == "video" else "image",
+        "upload_url": f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/{ressource}/upload",
+        "resource_type": ressource,
+        "media_type": groupe,
         "api_key": CLOUDINARY_API_KEY,
         "timestamp": donnees["timestamp"],
         "signature": donnees["signature"],
@@ -292,17 +306,41 @@ async def confirmer_upload_media(data: dict, db: Session = Depends(get_db)):
     from urllib.parse import urlparse
     parsed = urlparse(secure_url)
     chemin_upload = f"/{resource_type}/upload/"
-    host_ok = parsed.scheme == "https" and parsed.hostname == "res.cloudinary.com"
-    limite_octets = (POIDS_MAX_VIDEO_MO if resource_type == "video" else POIDS_MAX_IMAGE_MO) * 1024 * 1024
-    if (not public_id.startswith("grind_posts/") or not version.isdigit() or
-            not hmac.compare_digest(signature, attendu) or not host_ok or
-            resource_type not in ("image", "video") or chemin_upload not in parsed.path or
+    segments_url = parsed.path.strip("/").split("/")
+    format_asset = str(asset.get("format") or "").lower()
+    version_index = next((i for i, segment in enumerate(segments_url[3:], start=3)
+                          if re.fullmatch(r"v[0-9]+", segment)), None)
+    chemin_asset = "/".join(segments_url[version_index + 1:]) if version_index is not None else ""
+    chemin_attendu = f"{public_id}.{format_asset}" if format_asset else ""
+    host_ok = (
+        parsed.scheme == "https" and parsed.hostname == "res.cloudinary.com"
+        and parsed.port in (None, 443) and len(segments_url) > 3
+        and segments_url[0] == CLOUDINARY_CLOUD_NAME
+    )
+    audio = public_id.startswith("grind_discussion_audio/")
+    if audio:
+        ressource_ok = resource_type == "video" and chemin_upload in parsed.path
+        formats_autorises = {"webm", "ogg", "m4a", "mp3"}
+        limite_octets = POIDS_MAX_VOCAL_MO * 1024 * 1024
+    else:
+        ressource_ok = public_id.startswith("grind_posts/") and resource_type in ("image", "video") and chemin_upload in parsed.path
+        formats_autorises = {"jpg", "jpeg", "png", "webp", "mp4", "mov", "webm"}
+        limite_octets = (POIDS_MAX_VIDEO_MO if resource_type == "video" else POIDS_MAX_IMAGE_MO) * 1024 * 1024
+    chemin_url_ok = (
+        version_index is not None and segments_url[version_index] == f"v{version}"
+        and chemin_asset == chemin_attendu
+    ) if audio else True
+    if (not (audio or public_id.startswith("grind_posts/")) or not version.isdigit() or
+            not hmac.compare_digest(signature, attendu) or not host_ok or not ressource_ok or
+            format_asset not in formats_autorises or (audio and not chemin_url_ok) or
             taille <= 0 or taille > limite_octets):
         raise HTTPException(status_code=400, detail="La réponse du stockage n'a pas pu être vérifiée.")
 
     # Recrée côté serveur l'URL eager prévue et signée à l'origine : le clip
     # publié garde son cadrage et son watermark, sans faire confiance à une URL eager fournie par le navigateur.
-    if resource_type == "video":
+    if audio:
+        transformation = None
+    elif resource_type == "video":
         try:
             debut_video = float(data.get("debut_video"))
             fin_video = float(data.get("fin_video"))
@@ -312,13 +350,15 @@ async def confirmer_upload_media(data: dict, db: Session = Depends(get_db)):
         transformation = _parametres_upload_media("video", debut_video, fin_video)["eager"]
     else:
         transformation = _parametres_upload_media("image", None, None)["eager"]
-    media_url = secure_url.replace(chemin_upload, f"{chemin_upload}{transformation}/", 1)
+    media_url = secure_url if audio else secure_url.replace(chemin_upload, f"{chemin_upload}{transformation}/", 1)
     from media_assets import enregistrer_media_asset
-    formats_mime = {
+    formats_mime_audio = {"webm": "audio/webm", "ogg": "audio/ogg", "m4a": "audio/mp4", "mp3": "audio/mpeg"}
+    formats_mime_media = {
         "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp",
         "mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
     }
-    mime_verifie = formats_mime.get(str(asset.get("format") or "").lower())
+    formats_mime = formats_mime_audio if audio else formats_mime_media
+    mime_verifie = formats_mime.get(format_asset)
     if not mime_verifie:
         raise HTTPException(status_code=415, detail="Le format réel du média n'est pas reconnu.")
     enregistrer_media_asset(
@@ -326,7 +366,7 @@ async def confirmer_upload_media(data: dict, db: Session = Depends(get_db)):
         mime_type=mime_verifie, size_bytes=taille,
     )
     db.commit()
-    return {"media_url": media_url, "media_type": "video" if resource_type == "video" else "image"}
+    return {"media_url": media_url, "media_type": "audio" if audio else "video" if resource_type == "video" else "image"}
 
 
 @router.post("/api/media/upload")

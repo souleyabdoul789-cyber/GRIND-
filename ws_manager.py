@@ -12,6 +12,8 @@ devront se reconnecter. Acceptable pour un prototype, à revoir avec du
 Redis pub/sub si un jour plusieurs instances du serveur tournent en //.
 """
 
+import asyncio
+
 from fastapi import WebSocket
 
 
@@ -142,15 +144,29 @@ class ConnectionManager:
             self.discussion_connections.pop(discussion_id, None)
 
     async def diffuser_discussion(self, discussion_id: int, payload: dict, exclure: str | None = None):
+        """Diffuse en parallèle vers les connexions actives et retire les sockets mortes."""
         groupes = self.discussion_connections.get(discussion_id, {})
-        for username, connexions in list(groupes.items()):
-            if username == exclure:
-                continue
-            for ws in list(connexions):
-                try:
-                    await ws.send_json(payload)
-                except Exception:
-                    self.disconnect_discussion(discussion_id, username, ws)
+        cibles = [
+            (username, ws)
+            for username, connexions in list(groupes.items())
+            if username != exclure
+            for ws in list(connexions)
+        ]
+        if not cibles:
+            return
+
+        async def envoyer(username, ws):
+            try:
+                await asyncio.wait_for(ws.send_json(payload), timeout=5.0)
+                return None
+            except Exception:
+                return username, ws
+
+        resultats = await asyncio.gather(*(envoyer(username, ws) for username, ws in cibles))
+        for resultat in resultats:
+            if resultat is not None:
+                username, ws = resultat
+                self.disconnect_discussion(discussion_id, username, ws)
 
     async def retirer_connexions_discussion(self, discussion_id: int, username: str):
         """Révoque immédiatement toutes les sockets d'un membre retiré du groupe."""
