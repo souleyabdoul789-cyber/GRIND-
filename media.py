@@ -208,15 +208,27 @@ async def _envoyer_cloudinary(upload: UploadFile, nom: str, mime: str, ressource
     return resultat
 
 
-def _parametres_upload_media(groupe: str, debut_video: Optional[float], fin_video: Optional[float]) -> dict:
+def _parametres_upload_media(
+    groupe: str,
+    debut_video: Optional[float],
+    fin_video: Optional[float],
+    *,
+    prive_discussion: bool = False,
+) -> dict:
+    """Prépare les transformations médias.
+
+    Le fil public conserve son watermark historique. Les pièces de discussion
+    utilisent un dossier séparé et ne reçoivent jamais le logo GRIND.
+    """
     transformation = "q_auto,w_1080,h_1080,c_limit"
     if groupe == "video":
         transformation = f"so_{debut_video},eo_{fin_video},{transformation}"
-    return {
-        "folder": "grind_posts",
-        "eager": f"{transformation}/{WATERMARK}",
+    params = {
+        "folder": "grind_discussion_media" if prive_discussion else "grind_posts",
+        "eager": transformation if prive_discussion else f"{transformation}/{WATERMARK}",
         "allowed_formats": "jpg,jpeg,png,webp,mp4,mov,webm",
     }
+    return params
 
 
 def _valider_decoupe_video(debut_video: Optional[float], fin_video: Optional[float]):
@@ -240,16 +252,23 @@ async def signer_upload_media(data: dict, db: Session = Depends(get_db)):
         taille = int(taille)
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Taille du fichier invalide.")
-    # .webm existe en vidéo et en audio : le MIME du MediaRecorder tranche.
+    # .webm existe en vidéo et en audio : le MIME déclaré tranche.
     groupe = ("audio" if extension in AUDIO and mime_declare.startswith("audio/")
               else "video" if extension in VIDEOS else "image" if extension in IMAGES
-              else "audio" if extension in AUDIO else None)
+              else "audio" if extension in AUDIO else "document" if extension in DOCUMENTS else None)
+    usage_discussion = str(data.get("usage") or "").strip().lower() == "discussion"
+    if groupe == "document" and not usage_discussion:
+        raise HTTPException(status_code=400, detail="Le transfert direct de documents est réservé aux discussions privées.")
+    # Les vocaux conservent leur dossier dédié ; images et vidéos de discussion
+    # utilisent un espace séparé du fil public et ne reçoivent aucun watermark.
+    prive_discussion = usage_discussion and groupe in {"image", "video"}
     if not groupe:
         raise HTTPException(status_code=415, detail="Format média non accepté.")
-    limite_mo = POIDS_MAX_VIDEO_MO if groupe == "video" else POIDS_MAX_IMAGE_MO if groupe == "image" else POIDS_MAX_VOCAL_MO
+    limite_mo = (POIDS_MAX_VIDEO_MO if groupe == "video" else POIDS_MAX_IMAGE_MO if groupe == "image"
+                 else POIDS_MAX_VOCAL_MO if groupe == "audio" else POIDS_MAX_DOCUMENT_MO)
     if taille <= 0 or taille > limite_mo * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"Le fichier ne doit pas dépasser {limite_mo} Mo.")
-    catalogue_mime = VIDEOS if groupe == "video" else IMAGES if groupe == "image" else AUDIO
+    catalogue_mime = VIDEOS if groupe == "video" else IMAGES if groupe == "image" else AUDIO if groupe == "audio" else DOCUMENTS
     mime_attendu = catalogue_mime[extension][0]
     if mime_declare and mime_declare not in (mime_attendu, "application/octet-stream"):
         raise HTTPException(status_code=415, detail="Le type MIME ne correspond pas au format du fichier.")
@@ -269,8 +288,18 @@ async def signer_upload_media(data: dict, db: Session = Depends(get_db)):
             "allowed_formats": "webm,ogg,m4a,mp3",
         }
         ressource = "video"
+    elif groupe == "document":
+        params = {
+            "folder": "grind_documents",
+            # Cloudinary exige l'extension dans le public_id des ressources raw.
+            "public_id": f"{uuid.uuid4().hex}{extension}",
+            "allowed_formats": "pdf,docx",
+        }
+        ressource = "raw"
     else:
-        params = _parametres_upload_media(groupe, debut_video, fin_video)
+        params = _parametres_upload_media(
+            groupe, debut_video, fin_video, prive_discussion=prive_discussion
+        )
         params["public_id"] = uuid.uuid4().hex
         ressource = "video" if groupe == "video" else "image"
     _, donnees = _donnees_signature_cloudinary(params)
@@ -278,6 +307,7 @@ async def signer_upload_media(data: dict, db: Session = Depends(get_db)):
         "upload_url": f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/{ressource}/upload",
         "resource_type": ressource,
         "media_type": groupe,
+        "usage": "discussion" if usage_discussion else "public",
         "api_key": CLOUDINARY_API_KEY,
         "timestamp": donnees["timestamp"],
         "signature": donnees["signature"],
@@ -311,34 +341,43 @@ async def confirmer_upload_media(data: dict, db: Session = Depends(get_db)):
     version_index = next((i for i, segment in enumerate(segments_url[3:], start=3)
                           if re.fullmatch(r"v[0-9]+", segment)), None)
     chemin_asset = "/".join(segments_url[version_index + 1:]) if version_index is not None else ""
-    chemin_attendu = f"{public_id}.{format_asset}" if format_asset else ""
+    audio = public_id.startswith("grind_discussion_audio/")
+    document = public_id.startswith("grind_documents/")
+    prive_discussion = public_id.startswith("grind_discussion_media/")
+    # Les identifiants raw contiennent déjà l'extension ; vidéo/audio et image
+    # utilisent au contraire un public_id sans extension dans l'API Cloudinary.
+    chemin_attendu = (public_id if document else f"{public_id}.{format_asset}") if format_asset else ""
     host_ok = (
         parsed.scheme == "https" and parsed.hostname == "res.cloudinary.com"
         and parsed.port in (None, 443) and len(segments_url) > 3
         and segments_url[0] == CLOUDINARY_CLOUD_NAME
     )
-    audio = public_id.startswith("grind_discussion_audio/")
     if audio:
         ressource_ok = resource_type == "video" and chemin_upload in parsed.path
         formats_autorises = {"webm", "ogg", "m4a", "mp3"}
         limite_octets = POIDS_MAX_VOCAL_MO * 1024 * 1024
+    elif document:
+        ressource_ok = resource_type == "raw" and chemin_upload in parsed.path
+        formats_autorises = {"pdf", "docx"}
+        limite_octets = POIDS_MAX_DOCUMENT_MO * 1024 * 1024
     else:
-        ressource_ok = public_id.startswith("grind_posts/") and resource_type in ("image", "video") and chemin_upload in parsed.path
+        dossier_autorise = prive_discussion or public_id.startswith("grind_posts/")
+        ressource_ok = dossier_autorise and resource_type in ("image", "video") and chemin_upload in parsed.path
         formats_autorises = {"jpg", "jpeg", "png", "webp", "mp4", "mov", "webm"}
         limite_octets = (POIDS_MAX_VIDEO_MO if resource_type == "video" else POIDS_MAX_IMAGE_MO) * 1024 * 1024
     chemin_url_ok = (
         version_index is not None and segments_url[version_index] == f"v{version}"
         and chemin_asset == chemin_attendu
-    ) if audio else True
-    if (not (audio or public_id.startswith("grind_posts/")) or not version.isdigit() or
+    )
+    if (not (audio or document or prive_discussion or public_id.startswith("grind_posts/")) or not version.isdigit() or
             not hmac.compare_digest(signature, attendu) or not host_ok or not ressource_ok or
-            format_asset not in formats_autorises or (audio and not chemin_url_ok) or
+            format_asset not in formats_autorises or not chemin_url_ok or
             taille <= 0 or taille > limite_octets):
         raise HTTPException(status_code=400, detail="La réponse du stockage n'a pas pu être vérifiée.")
 
-    # Recrée côté serveur l'URL eager prévue et signée à l'origine : le clip
-    # publié garde son cadrage et son watermark, sans faire confiance à une URL eager fournie par le navigateur.
-    if audio:
+    # Le watermark ne s'applique qu'aux publications publiques.
+    # Les médias de discussion restent sans logo et sous contrôle des tickets GRIND.
+    if audio or document:
         transformation = None
     elif resource_type == "video":
         try:
@@ -347,17 +386,22 @@ async def confirmer_upload_media(data: dict, db: Session = Depends(get_db)):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Découpe vidéo manquante pour confirmer le média.")
         _valider_decoupe_video(debut_video, fin_video)
-        transformation = _parametres_upload_media("video", debut_video, fin_video)["eager"]
+        transformation = _parametres_upload_media(
+            "video", debut_video, fin_video, prive_discussion=prive_discussion
+        )["eager"]
     else:
-        transformation = _parametres_upload_media("image", None, None)["eager"]
-    media_url = secure_url if audio else secure_url.replace(chemin_upload, f"{chemin_upload}{transformation}/", 1)
+        transformation = _parametres_upload_media(
+            "image", None, None, prive_discussion=prive_discussion
+        )["eager"]
+    media_url = secure_url if audio or document else secure_url.replace(chemin_upload, f"{chemin_upload}{transformation}/", 1)
     from media_assets import enregistrer_media_asset
     formats_mime_audio = {"webm": "audio/webm", "ogg": "audio/ogg", "m4a": "audio/mp4", "mp3": "audio/mpeg"}
+    formats_mime_document = {"pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
     formats_mime_media = {
         "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp",
         "mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
     }
-    formats_mime = formats_mime_audio if audio else formats_mime_media
+    formats_mime = formats_mime_audio if audio else formats_mime_document if document else formats_mime_media
     mime_verifie = formats_mime.get(format_asset)
     if not mime_verifie:
         raise HTTPException(status_code=415, detail="Le format réel du média n'est pas reconnu.")
@@ -366,7 +410,11 @@ async def confirmer_upload_media(data: dict, db: Session = Depends(get_db)):
         mime_type=mime_verifie, size_bytes=taille,
     )
     db.commit()
-    return {"media_url": media_url, "media_type": "audio" if audio else "video" if resource_type == "video" else "image"}
+    return {
+        "media_url": media_url,
+        "media_type": "audio" if audio else "document" if document else "video" if resource_type == "video" else "image",
+        "usage": "discussion" if (audio or document or prive_discussion or str(data.get("usage") or "").strip().lower() == "discussion") else "public",
+    }
 
 
 @router.post("/api/media/upload")

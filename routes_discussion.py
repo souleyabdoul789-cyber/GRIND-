@@ -11,7 +11,7 @@ import hashlib
 import re
 import secrets
 import uuid
-from urllib.parse import urlparse, quote, urljoin
+from urllib.parse import urlparse, urlunparse, quote, urljoin
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, File, Form, UploadFile, BackgroundTasks
@@ -46,6 +46,32 @@ def _url_telechargement_document_cloudinary(source: str) -> str | None:
     return url_privee_telechargement_raw(source, {"pdf", "docx"})
 
 
+def _url_media_discussion_sans_filigrane(source: str) -> str:
+    """Retire uniquement l'étape de watermark des anciennes URLs du fil privé.
+
+    Les assets historiques du fil utilisaient le dossier public grind_posts avec
+    un watermark ajouté dans l'URL de transformation. Le média source reste le
+    même ; seules les URLs de livraison de discussion sont normalisées ici.
+    """
+    parsed = urlparse(source or "")
+    if (parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com"
+            or parsed.port not in (None, 443) or not CLOUDINARY_CLOUD_NAME):
+        return source
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 6 or parts[0] != CLOUDINARY_CLOUD_NAME or parts[2] != "upload":
+        return source
+    if parts[1] not in {"image", "video"}:
+        return source
+    version_index = next((i for i, part in enumerate(parts[3:], start=3)
+                          if re.fullmatch(r"v\d+", part)), None)
+    if version_index is None or version_index >= len(parts) - 1:
+        return source
+    transformations = [part for part in parts[3:version_index]
+                       if "l_grind_watermark" not in part]
+    nouvelle = parts[:3] + transformations + parts[version_index:]
+    return urlunparse(parsed._replace(path="/" + "/".join(nouvelle)))
+
+
 def _url_poster_video_cloudinary(source: str) -> str | None:
     """Construit l'URL JPG de la première image d'une vidéo GRIND Cloudinary.
 
@@ -63,7 +89,8 @@ def _url_poster_video_cloudinary(source: str) -> str | None:
     version_index = next((i for i, part in enumerate(parts[3:], start=3) if re.fullmatch(r"v\d+", part)), None)
     if version_index is None or version_index >= len(parts) - 1:
         return None
-    transformations = parts[3:version_index]
+    transformations = [part for part in parts[3:version_index]
+                       if "l_grind_watermark" not in part]
     if transformations:
         # A clip published from a trimmed video URL keeps its original start
         # offset, but `eo` (end offset) is irrelevant when extracting a still.
@@ -279,8 +306,8 @@ def _verifier_piece(piece: dict | None, db: Session | None = None, username: str
         raise HTTPException(status_code=400, detail="La référence Cloudinary n'est pas complète.")
     public_id = "/".join(segments[version_index + 1:])
     dossier_attendu = {
-        "image": ("grind_posts/",),
-        "video": ("grind_posts/",),
+        "image": ("grind_posts/", "grind_discussion_media/"),
+        "video": ("grind_posts/", "grind_discussion_media/"),
         "document": ("grind_documents/",),
         "audio": ("grind_discussion_audio/",),
     }
@@ -351,7 +378,7 @@ def _exiger_admin(membre: ClasseDiscussionMembre):
 
 
 @router.get("/api/classes/{classe_id}/discussion")
-async def obtenir_discussion(classe_id: int, session_token: str, db: Session = Depends(get_db)):
+async def obtenir_discussion(classe_id: int, request: Request, session_token: str, db: Session = Depends(get_db)):
     username = _identite(session_token, db)
     classe, discussion = _classe_et_discussion(db, classe_id)
     moi = _membre(db, discussion.id, username)
@@ -370,11 +397,20 @@ async def obtenir_discussion(classe_id: int, session_token: str, db: Session = D
         ClasseDiscussionMention.lu == 0,
         ClasseDiscussionMessage.discussion_id == discussion.id,
     ).count()
-    db.commit()  # persiste la création lazy éventuelle pour les anciennes classes
+    photo_url_privee = None
+    if discussion.photo_url:
+        ticket_photo = creer_ticket_media(
+            db, username=username, resource_type="discussion_photo", resource_id=discussion.id,
+            container_id=classe.id, purpose="read", duree=3600,
+        )
+        photo_url_privee = (
+            f"{str(request.base_url).rstrip('/')}/api/classes/{classe.id}/discussion/photo?ticket={ticket_photo}"
+        )
+    db.commit()  # persiste la création lazy éventuelle et le ticket photo individuel
     return {
         "discussion": {
             "id": discussion.id, "classe_id": classe.id,
-            "nom": discussion.nom or classe.nom, "photo_url": discussion.photo_url,
+            "nom": discussion.nom or classe.nom, "photo_url": photo_url_privee,
             "code_invitation": discussion.code_invitation,
             "owner_username": discussion.owner_username,
             "nb_membres": len(membres), "limite_membres": MAX_MEMBRES_DISCUSSION,
@@ -541,6 +577,8 @@ async def obtenir_piece_message(
 
     media_poster = False
     source_url = message.piece_url
+    if message.piece_type in ("image", "video"):
+        source_url = _url_media_discussion_sans_filigrane(source_url)
     if poster:
         if message.piece_type != "video":
             raise HTTPException(status_code=400, detail="Aucune miniature vidéo pour cette pièce jointe.")
@@ -736,7 +774,7 @@ async def envoyer_vocal_discussion(
     db.commit()
     db.refresh(message)
     payload = _serialiser_message(db, classe.id, message)
-    await manager.diffuser_discussion(discussion.id, {"type": "message", "message": payload})
+    manager.planifier_diffusion_discussion(discussion.id, {"type": "message", "message": payload})
     evenements = _preparer_notifications_discussion(db, notifications)
     if evenements:
         background_tasks.add_task(_diffuser_notifications_discussion, evenements)
@@ -848,7 +886,7 @@ async def envoyer_message(classe_id: int, data: dict, background_tasks: Backgrou
         raise
     db.refresh(message)
     payload = _serialiser_message(db, classe.id, message)
-    await manager.diffuser_discussion(discussion.id, {"type": "message", "message": payload})
+    manager.planifier_diffusion_discussion(discussion.id, {"type": "message", "message": payload})
     evenements = _preparer_notifications_discussion(db, notifications_generiques)
     if evenements:
         background_tasks.add_task(_diffuser_notifications_discussion, evenements)
@@ -1010,20 +1048,133 @@ async def marquer_mention_lue(classe_id: int, mention_id: int, data: dict, db: S
     return {"success": True, "mentions_non_lues": count}
 
 
+@router.get("/api/classes/{classe_id}/discussion/photo")
+async def obtenir_photo_discussion(
+    classe_id: int, request: Request, ticket: str, db: Session = Depends(get_db),
+):
+    """Diffuse la photo du groupe via un ticket individuel réservé aux membres."""
+    _, discussion = _classe_et_discussion(db, classe_id)
+    autorisation = verifier_ticket_media(
+        db, ticket, resource_type="discussion_photo", resource_id=discussion.id,
+        container_id=classe_id, purpose="read",
+    )
+    _membre(db, discussion.id, autorisation.username)
+    source_url = _url_media_discussion_sans_filigrane(str(discussion.photo_url or ""))
+    parsed = urlparse(source_url)
+    from media_assets import extraire_reference_cloudinary
+    reference = extraire_reference_cloudinary(source_url)
+    public_id = reference[1] if reference else ""
+    if (parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com"
+            or parsed.port not in (None, 443) or not CLOUDINARY_CLOUD_NAME
+            or parsed.path.strip("/").split("/", 1)[0] != CLOUDINARY_CLOUD_NAME
+            or "/image/upload/" not in parsed.path
+            or not (public_id.startswith("grind_discussion_media/") or public_id.startswith("grind_posts/"))):
+        raise HTTPException(status_code=404, detail="Photo de discussion indisponible.")
+
+    headers = {"Accept": "image/*", "Accept-Encoding": "identity"}
+    range_header = request.headers.get("range")
+    if range_header and re.fullmatch(r"bytes=(?:\d+-\d*|-\d+)", range_header.strip()):
+        headers["Range"] = range_header.strip()
+    client = httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0), follow_redirects=False)
+    upstream = None
+    current_url = source_url
+    try:
+        for numero_redirection in range(5):
+            upstream = await client.send(client.build_request("GET", current_url, headers=headers), stream=True)
+            if upstream.status_code not in (301, 302, 303, 307, 308):
+                break
+            location = upstream.headers.get("location")
+            await upstream.aclose()
+            upstream = None
+            if not location or numero_redirection == 4:
+                break
+            destination = urljoin(current_url, location)
+            cible = urlparse(destination)
+            hote = (cible.hostname or "").lower()
+            domaine_cloudinary = hote == "cloudinary.com" or hote.endswith(".cloudinary.com")
+            if cible.scheme != "https" or not domaine_cloudinary:
+                break
+            current_url = destination
+        if upstream is None or upstream.status_code not in (200, 206):
+            status = upstream.status_code if upstream is not None else 0
+            if upstream is not None:
+                await upstream.aclose()
+                upstream = None
+            await client.aclose()
+            raise HTTPException(status_code=502 if status >= 500 or status == 0 else 404, detail="Photo de discussion indisponible.")
+        response_headers = {
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Accept-Ranges": "bytes",
+        }
+        for key in ("content-length", "content-range", "etag"):
+            if upstream.headers.get(key):
+                response_headers[key.title()] = upstream.headers[key]
+
+        async def flux_photo():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            flux_photo(), status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type") or "image/jpeg",
+            headers=response_headers,
+        )
+    except HTTPException:
+        if upstream is not None:
+            await upstream.aclose()
+        await client.aclose()
+        raise
+    except httpx.HTTPError:
+        if upstream is not None:
+            await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Photo de discussion indisponible.")
+
+
 @router.post("/api/classes/{classe_id}/discussion/photo")
-async def modifier_photo(classe_id: int, data: dict, db: Session = Depends(get_db)):
+async def modifier_photo(classe_id: int, request: Request, data: dict, db: Session = Depends(get_db)):
     username = _identite(data.get("session_token", ""), db)
     classe, discussion = _classe_et_discussion(db, classe_id)
     membre = _membre(db, discussion.id, username)
     _exiger_admin(membre)
     url = str(data.get("photo_url") or "").strip()
     parsed = urlparse(url)
-    if url and not (parsed.scheme == "https" and parsed.hostname == "res.cloudinary.com" and "/image/upload/" in parsed.path):
-        raise HTTPException(status_code=400, detail="La photo doit provenir du stockage image GRIND.")
+    if url:
+        if not (parsed.scheme == "https" and parsed.hostname == "res.cloudinary.com"
+                and parsed.port in (None, 443) and CLOUDINARY_CLOUD_NAME
+                and parsed.path.strip("/").split("/", 1)[0] == CLOUDINARY_CLOUD_NAME
+                and "/image/upload/" in parsed.path):
+            raise HTTPException(status_code=400, detail="La photo doit provenir du stockage image GRIND.")
+        from media_assets import verifier_proprietaire_media
+        asset = verifier_proprietaire_media(db, username=username, url=url)
+        if not str(asset.mime_type or "").lower().startswith("image/"):
+            raise HTTPException(status_code=415, detail="La photo du groupe doit être une image.")
+        if int(asset.size_bytes or 0) <= 0 or int(asset.size_bytes or 0) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="La photo du groupe dépasse 25 Mo.")
+        from media_assets import extraire_reference_cloudinary
+        reference = extraire_reference_cloudinary(url)
+        public_id = reference[1] if reference else ""
+        if not (public_id.startswith("grind_discussion_media/") or public_id.startswith("grind_posts/")):
+            raise HTTPException(status_code=400, detail="Cette image ne provient pas d'un espace média GRIND autorisé.")
     discussion.photo_url = url or None
     db.commit()
-    await manager.diffuser_discussion(discussion.id, {"type": "group_update", "photo_url": discussion.photo_url})
-    return {"success": True, "photo_url": discussion.photo_url}
+    photo_url_privee = None
+    if discussion.photo_url:
+        ticket_photo = creer_ticket_media(
+            db, username=username, resource_type="discussion_photo", resource_id=discussion.id,
+            container_id=classe.id, purpose="read", duree=3600,
+        )
+        db.commit()
+        photo_url_privee = (
+            f"{str(request.base_url).rstrip('/')}/api/classes/{classe.id}/discussion/photo?ticket={ticket_photo}"
+        )
+    manager.planifier_diffusion_discussion(discussion.id, {"type": "group_update", "photo_changed": True})
+    return {"success": True, "photo_url": photo_url_privee}
 
 
 @router.post("/api/classes/{classe_id}/discussion/admins")

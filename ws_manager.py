@@ -22,6 +22,11 @@ class ConnectionManager:
         self.notif_connections: dict[str, WebSocket] = {}
         self.session_connections: dict[int, dict[str, WebSocket]] = {}
         self.discussion_connections: dict[int, dict[str, set[WebSocket]]] = {}
+        self._discussion_send_locks: dict[int, asyncio.Lock] = {}
+        self._discussion_send_users: dict[int, int] = {}
+        self._discussion_queues: dict[int, asyncio.Queue] = {}
+        self._discussion_workers: dict[int, asyncio.Task] = {}
+        self._taches_diffusion_discussion: set[asyncio.Task] = set()
 
     # ---------- Notifications globales ----------
     async def connect_notif(self, username: str, ws: WebSocket):
@@ -142,6 +147,82 @@ class ConnectionManager:
                 groupes.pop(username, None)
         if not groupes:
             self.discussion_connections.pop(discussion_id, None)
+        cle_socket = id(ws)
+        if self._discussion_send_users.get(cle_socket, 0) == 0:
+            self._discussion_send_locks.pop(cle_socket, None)
+            self._discussion_send_users.pop(cle_socket, None)
+
+    def planifier_diffusion_discussion(self, discussion_id: int, payload: dict, exclure: str | None = None):
+        """Met en file la diffusion après commit, sans ralentir l'accusé HTTP.
+
+        Un seul worker par discussion vide la file dans l'ordre d'arrivée. Les
+        connexions destinataires sont ensuite notifiées en parallèle. Les tâches
+        sont suivies et les exceptions consommées ; REST reste le filet de sécurité.
+        """
+        queue = self._discussion_queues.setdefault(discussion_id, asyncio.Queue())
+        queue.put_nowait((payload, exclure))
+        worker = self._discussion_workers.get(discussion_id)
+        if worker is None or worker.done():
+            worker = asyncio.create_task(self._vider_file_diffusion_discussion(discussion_id, queue))
+            self._discussion_workers[discussion_id] = worker
+            self._taches_diffusion_discussion.add(worker)
+
+            def terminer(tache: asyncio.Task):
+                self._taches_diffusion_discussion.discard(tache)
+                try:
+                    tache.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    # Le transport WebSocket ne doit jamais annuler le commit SQL.
+                    pass
+                if self._discussion_workers.get(discussion_id) is tache:
+                    self._discussion_workers.pop(discussion_id, None)
+                    if queue.empty():
+                        self._discussion_queues.pop(discussion_id, None)
+                    else:
+                        # Un événement a pu arriver entre la dernière lecture et
+                        # le callback de fin : ne jamais laisser la file endormie.
+                        self.planifier_reprise_file_diffusion(discussion_id, queue)
+
+            worker.add_done_callback(terminer)
+        return worker
+
+    async def _vider_file_diffusion_discussion(self, discussion_id: int, queue: asyncio.Queue):
+        while True:
+            try:
+                payload, exclure = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await self.diffuser_discussion(discussion_id, payload, exclure)
+            except Exception:
+                # Le prochain message ne doit pas rester bloqué par un événement WS défaillant.
+                pass
+            finally:
+                queue.task_done()
+
+    def planifier_reprise_file_diffusion(self, discussion_id: int, queue: asyncio.Queue):
+        worker = asyncio.create_task(self._vider_file_diffusion_discussion(discussion_id, queue))
+        self._discussion_workers[discussion_id] = worker
+        self._taches_diffusion_discussion.add(worker)
+
+        def terminer(tache: asyncio.Task):
+            self._taches_diffusion_discussion.discard(tache)
+            try:
+                tache.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            if self._discussion_workers.get(discussion_id) is tache:
+                self._discussion_workers.pop(discussion_id, None)
+                if queue.empty():
+                    self._discussion_queues.pop(discussion_id, None)
+                else:
+                    self.planifier_reprise_file_diffusion(discussion_id, queue)
+
+        worker.add_done_callback(terminer)
 
     async def diffuser_discussion(self, discussion_id: int, payload: dict, exclure: str | None = None):
         """Diffuse en parallèle vers les connexions actives et retire les sockets mortes."""
@@ -156,11 +237,27 @@ class ConnectionManager:
             return
 
         async def envoyer(username, ws):
+            cle_socket = id(ws)
+            verrou = self._discussion_send_locks.setdefault(cle_socket, asyncio.Lock())
+            self._discussion_send_users[cle_socket] = self._discussion_send_users.get(cle_socket, 0) + 1
             try:
-                await asyncio.wait_for(ws.send_json(payload), timeout=5.0)
+                # Un seul écrivain par socket : évite les trames concurrentes
+                # et conserve l'ordre des messages créés dans le même process.
+                async with verrou:
+                    await asyncio.wait_for(ws.send_json(payload), timeout=5.0)
                 return None
             except Exception:
                 return username, ws
+            finally:
+                actifs = max(0, self._discussion_send_users.get(cle_socket, 1) - 1)
+                if actifs:
+                    self._discussion_send_users[cle_socket] = actifs
+                else:
+                    self._discussion_send_users.pop(cle_socket, None)
+                    groupes_actifs = self.discussion_connections.get(discussion_id, {})
+                    encore_connectee = ws in groupes_actifs.get(username, set())
+                    if not encore_connectee:
+                        self._discussion_send_locks.pop(cle_socket, None)
 
         resultats = await asyncio.gather(*(envoyer(username, ws) for username, ws in cibles))
         for resultat in resultats:
