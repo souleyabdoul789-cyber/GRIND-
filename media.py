@@ -16,6 +16,7 @@ import hmac
 import zipfile
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -28,9 +29,80 @@ from auth_grind import verifier_session
 router = APIRouter()
 logger = logging.getLogger("grind.media")
 
-CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
-CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
-CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
+
+def _charger_configuration_cloudinary() -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Accepte CLOUDINARY_URL ou les trois variables Cloudinary séparées.
+
+    CLOUDINARY_URL utilise le format officiel :
+    cloudinary://<API_KEY>:<API_SECRET>@<CLOUD_NAME>.
+    Les variables séparées restent prioritaires lorsqu'elles sont renseignées.
+    En cas de noms de cloud contradictoires, la configuration est refusée plutôt
+    que de signer un transfert vers un compte différent de celui attendu.
+    """
+    cloud_name = (os.getenv("CLOUDINARY_CLOUD_NAME") or "").strip()
+    api_key = (os.getenv("CLOUDINARY_API_KEY") or "").strip()
+    api_secret = (os.getenv("CLOUDINARY_API_SECRET") or "").strip()
+    cloudinary_url = (os.getenv("CLOUDINARY_URL") or "").strip()
+
+    def nom_cloud_valide(value: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{1,127}", value or ""))
+
+    candidats = []
+    if cloudinary_url:
+        candidats.append(cloudinary_url)
+    if cloud_name.startswith(("cloudinary://", "http://", "https://")):
+        candidats.append(cloud_name)
+        cloud_name = ""
+    elif cloud_name.startswith(("res.cloudinary.com/", "api.cloudinary.com/", "api-eu.cloudinary.com/", "api-ap.cloudinary.com/")):
+        candidats.append("https://" + cloud_name)
+        cloud_name = ""
+
+    nom_depuis_url = ""
+    cle_depuis_url = ""
+    secret_depuis_url = ""
+    for candidat in candidats:
+        try:
+            parsed = urlsplit(candidat)
+            if parsed.scheme.lower() == "cloudinary":
+                nom_depuis_url = nom_depuis_url or (parsed.hostname or "")
+                cle_depuis_url = cle_depuis_url or unquote(parsed.username or "")
+                secret_depuis_url = secret_depuis_url or unquote(parsed.password or "")
+                continue
+            if parsed.scheme.lower() not in {"http", "https"}:
+                continue
+            host = (parsed.hostname or "").lower()
+            segments = [part for part in parsed.path.split("/") if part]
+            if host == "res.cloudinary.com" and segments:
+                nom_depuis_url = nom_depuis_url or segments[0]
+            elif host in {"api.cloudinary.com", "api-eu.cloudinary.com", "api-ap.cloudinary.com"}:
+                if len(segments) >= 2 and segments[0] == "v1_1":
+                    nom_depuis_url = nom_depuis_url or segments[1]
+        except (TypeError, ValueError):
+            continue
+
+    cloud_name = cloud_name.strip().strip("/")
+    nom_depuis_url = nom_depuis_url.strip().strip("/")
+    if cloud_name and not nom_cloud_valide(cloud_name):
+        logger.warning("Configuration Cloudinary invalide : CLOUDINARY_CLOUD_NAME est mal formé.")
+        cloud_name = ""
+    if cloud_name and nom_depuis_url and cloud_name.lower() != nom_depuis_url.lower():
+        logger.error("Configuration Cloudinary incohérente : les noms de cloud configurés ne correspondent pas.")
+        cloud_name = ""
+    else:
+        cloud_name = cloud_name or nom_depuis_url
+
+    # Priorité aux variables dédiées, puis repli sur les identifiants intégrés
+    # dans CLOUDINARY_URL si elles ne sont pas renseignées.
+    api_key = api_key or cle_depuis_url
+    api_secret = api_secret or secret_depuis_url
+
+    if not nom_cloud_valide(cloud_name):
+        logger.warning("Configuration Cloudinary invalide : nom de cloud absent ou mal formé.")
+        cloud_name = ""
+    return cloud_name or None, api_key or None, api_secret or None
+
+
+CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET = _charger_configuration_cloudinary()
 
 DUREE_MAX_VIDEO_SECONDES = 3540  # 59 minutes : format cours, pas clip court
 POIDS_MAX_IMAGE_MO = 25
@@ -185,7 +257,7 @@ async def _envoyer_cloudinary_chunked(upload: UploadFile, nom: str, mime: str, r
 
 async def _envoyer_cloudinary(upload: UploadFile, nom: str, mime: str, ressource: str, params: dict):
     if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
-        raise HTTPException(status_code=503, detail="Le stockage Cloudinary n'est pas configuré côté serveur.")
+        raise HTTPException(status_code=503, detail="Configuration Cloudinary absente ou invalide. Configure CLOUDINARY_URL ou les variables CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY et CLOUDINARY_API_SECRET dans le serveur GRIND.")
     try:
         upload.file.seek(0, os.SEEK_END)
         taille = upload.file.tell()
@@ -243,7 +315,7 @@ async def signer_upload_media(data: dict, db: Session = Depends(get_db)):
     """Prépare un upload direct Cloudinary : le secret reste sur le serveur."""
     _verifier_compte_upload(data.get("session_token", ""), db)
     if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
-        raise HTTPException(status_code=503, detail="Le stockage Cloudinary n'est pas configuré côté serveur.")
+        raise HTTPException(status_code=503, detail="Configuration Cloudinary absente ou invalide. Configure CLOUDINARY_URL ou les variables CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY et CLOUDINARY_API_SECRET dans le serveur GRIND.")
     nom = Path(str(data.get("file_name") or "media")).name[:180]
     extension = Path(nom).suffix.lower()
     taille = data.get("file_size")
@@ -321,7 +393,7 @@ async def signer_upload_media(data: dict, db: Session = Depends(get_db)):
 async def confirmer_upload_media(data: dict, db: Session = Depends(get_db)):
     username = _verifier_compte_upload(data.get("session_token", ""), db)
     if not CLOUDINARY_API_SECRET:
-        raise HTTPException(status_code=503, detail="La validation du stockage n'est pas configurée.")
+        raise HTTPException(status_code=503, detail="Configuration Cloudinary absente ou invalide. Configure CLOUDINARY_URL ou les variables CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY et CLOUDINARY_API_SECRET dans le serveur GRIND.")
     asset = data.get("asset") or {}
     public_id = str(asset.get("public_id") or "")
     version = str(asset.get("version") or "")
