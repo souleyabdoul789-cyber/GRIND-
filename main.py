@@ -30,6 +30,9 @@ from routes_discussion import router as router_discussion
 from routes_push import router as router_push
 from models import CountryAccessBlock
 
+# Enregistre les hooks de nettoyage des médias publics après suppression confirmée.
+import media_assets as _media_assets_cleanup
+
 METERED_TURN_USERNAME = os.getenv("METERED_TURN_USERNAME")
 METERED_TURN_CREDENTIAL = os.getenv("METERED_TURN_CREDENTIAL")
 
