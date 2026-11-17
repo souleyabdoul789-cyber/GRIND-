@@ -20,7 +20,7 @@ from models import (Profil, Classe, ClasseMembre, CompteGrind, ClasseDiscussion,
 from classe_salle_etendue import ClasseTableauDelegation
 from discussion_service import assurer_discussion
 from ws_manager import manager
-from push_notifications import envoyer_push_a_utilisateur
+from push_notifications import envoyer_notifications_push
 from classe_salle_service import assurer_prof_et_sieges, prochain_siege
 
 router = APIRouter()
@@ -247,15 +247,35 @@ async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db))
         raise HTTPException(status_code=400, detail="Aucun pupitre disponible dans cette classe")
     db.add(ClasseMembre(classe_id=classe.id, username=username, role="membre", siege_index=siege))
     discussion = assurer_discussion(db, classe)
+
+    notification_adhesion = None
+    if classe.createur_username != username:
+        notification_adhesion = NotificationGrind(
+            destinataire_username=classe.createur_username,
+            acteur_username=username,
+            type="nouveau_membre_classe",
+            resource_type="classe",
+            resource_id=classe.id,
+            classe_id=classe.id,
+            extrait=classe.nom[:240],
+        )
+        db.add(notification_adhesion)
     db.commit()
 
-    await manager.diffuser_discussion(discussion.id, {"type": "member_joined", "username": username, "nom": username})
-    await manager.notifier_nouveau_membre_classe(classe.id, classe.nom, classe.createur_username, username)
-    await envoyer_push_a_utilisateur(
-        db, classe.createur_username, "Nouveau membre dans ta classe",
-        f"{username} a rejoint la classe « {classe.nom} ».",
-        {"event_type": "nouveau_membre_classe", "classe_id": classe.id},
-    )
+    compte_membre = db.get(CompteGrind, username)
+    nom_membre = " ".join(x for x in [getattr(compte_membre, "prenom", None), getattr(compte_membre, "nom", None)] if x).strip() or username
+    await manager.diffuser_discussion(discussion.id, {"type": "member_joined", "username": username, "nom": nom_membre})
+    if notification_adhesion is not None:
+        db.refresh(notification_adhesion)
+        await manager.notifier_utilisateur(classe.createur_username, {
+            "type": "persistante", "id": f"notification-{notification_adhesion.id}",
+            "notificationId": notification_adhesion.id, "eventType": "nouveau_membre_classe",
+            "acteur": username, "acteur_nom": nom_membre,
+            "resource_type": "classe", "resource_id": classe.id,
+            "classe_id": classe.id, "classe_nom": classe.nom,
+            "extrait": classe.nom, "lu": False,
+        })
+        await envoyer_notifications_push(db, [notification_adhesion])
 
     return {"success": True, "classe_id": classe.id, "nom": classe.nom}
 
@@ -286,6 +306,23 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
         ClasseDiscussionMembre.discussion_id.in_([d.id for d in discussions]), ClasseDiscussionMembre.actif == 1
     ).group_by(ClasseDiscussionMembre.discussion_id).all() if discussions else []
     nb_discussion_par_id = {did: int(total) for did, total in discussions_actifs}
+
+    # Compteur individuel des messages non lus : il dépend du curseur de lecture
+    # du membre courant, pas du nombre total de messages ni du nombre de membres.
+    # Les messages envoyés par l'utilisateur ne font pas monter son badge.
+    non_lus_rows = db.query(
+        ClasseDiscussionMessage.discussion_id,
+        func.count(ClasseDiscussionMessage.id),
+    ).join(
+        ClasseDiscussionMembre,
+        ClasseDiscussionMembre.discussion_id == ClasseDiscussionMessage.discussion_id,
+    ).filter(
+        ClasseDiscussionMembre.username == username,
+        ClasseDiscussionMembre.actif == 1,
+        ClasseDiscussionMessage.id > func.coalesce(ClasseDiscussionMembre.dernier_message_lu_id, 0),
+        ClasseDiscussionMessage.auteur_username != username,
+    ).group_by(ClasseDiscussionMessage.discussion_id).all() if discussions else []
+    messages_non_lus_par_discussion = {did: int(total) for did, total in non_lus_rows}
     membres_discussion_existants = db.query(ClasseDiscussionMembre).filter(
         ClasseDiscussionMembre.discussion_id.in_([d.id for d in discussions])
     ).all() if discussions else []
@@ -343,6 +380,7 @@ async def lister_mes_classes(session_token: str, db: Session = Depends(get_db)):
             "est_membre_discussion": discussion.id in membre_discussion_ids,
             "discussion_id": discussion.id,
             "discussion_membres": nb_discussion_par_id.get(discussion.id, 0),
+            "discussion_messages_non_lus": messages_non_lus_par_discussion.get(discussion.id, 0),
             "discussion_invitation": discussion.code_invitation,
         })
 

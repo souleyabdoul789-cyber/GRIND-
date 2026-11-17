@@ -235,14 +235,43 @@ def _preparer_notifications_discussion(db: Session, notifications):
         return []
     usernames = {notification.acteur_username for notification in lignes if notification.acteur_username}
     noms = _identites_comptes(db, usernames)
-    return [(notification.destinataire_username, {
-        "type": "persistante", "id": f"notification-{notification.id}",
-        "notificationId": notification.id, "eventType": notification.type,
-        "acteur": notification.acteur_username,
-        "acteur_nom": noms.get(notification.acteur_username, notification.acteur_username),
-        "resource_type": notification.resource_type, "resource_id": notification.resource_id,
-        "classe_id": notification.classe_id, "extrait": notification.extrait, "lu": False,
-    }) for notification in lignes]
+    classe_ids = {int(n.classe_id) for n in lignes if n.classe_id}
+    classes = db.query(Classe).filter(Classe.id.in_(classe_ids)).all() if classe_ids else []
+    classes_map = {c.id: c for c in classes}
+    discussion_ids = {
+        int(n.resource_id) for n in lignes
+        if n.resource_type == "classe_discussion" and n.resource_id
+    }
+    message_ids = {
+        int(n.resource_id) for n in lignes
+        if n.resource_type == "classe_discussion_message" and n.resource_id
+    }
+    messages = db.query(ClasseDiscussionMessage).filter(ClasseDiscussionMessage.id.in_(message_ids)).all() if message_ids else []
+    discussion_ids.update(int(m.discussion_id) for m in messages if m.discussion_id)
+    discussions = db.query(ClasseDiscussion).filter(ClasseDiscussion.id.in_(discussion_ids)).all() if discussion_ids else []
+    discussions_map = {d.id: d for d in discussions}
+    discussion_id_par_message = {m.id: m.discussion_id for m in messages}
+    resultats = []
+    for notification in lignes:
+        discussion_id = (
+            notification.resource_id if notification.resource_type == "classe_discussion"
+            else discussion_id_par_message.get(notification.resource_id) if notification.resource_type == "classe_discussion_message"
+            else None
+        )
+        classe = classes_map.get(notification.classe_id)
+        discussion = discussions_map.get(discussion_id)
+        resultats.append((notification.destinataire_username, {
+            "type": "persistante", "id": f"notification-{notification.id}",
+            "notificationId": notification.id, "eventType": notification.type,
+            "acteur": notification.acteur_username,
+            "acteur_nom": noms.get(notification.acteur_username, notification.acteur_username),
+            "resource_type": notification.resource_type, "resource_id": notification.resource_id,
+            "classe_id": notification.classe_id,
+            "classe_nom": classe.nom if classe else None,
+            "discussion_nom": discussion.nom if discussion else None,
+            "extrait": notification.extrait, "lu": bool(notification.lu),
+        }))
+    return resultats
 
 
 async def _diffuser_notifications_discussion(evenements):
@@ -1300,8 +1329,32 @@ async def rejoindre_discussion(data: dict, db: Session = Depends(get_db)):
         membre.actif = 1
     else:
         db.add(ClasseDiscussionMembre(discussion_id=discussion.id, username=username, role="membre", actif=1, banni=0))
+
+    notification_adhesion = None
+    if discussion.owner_username != username:
+        notification_adhesion = NotificationGrind(
+            destinataire_username=discussion.owner_username,
+            acteur_username=username,
+            type="nouveau_membre_classe",
+            resource_type="classe_discussion",
+            resource_id=discussion.id,
+            classe_id=classe.id,
+            extrait=discussion.nom[:240],
+        )
+        db.add(notification_adhesion)
     db.commit()
     await manager.diffuser_discussion(discussion.id, {"type": "member_joined", "username": username, "nom": _nom_compte(db, username)})
+    if notification_adhesion is not None:
+        db.refresh(notification_adhesion)
+        await manager.notifier_utilisateur(discussion.owner_username, {
+            "type": "persistante", "id": f"notification-{notification_adhesion.id}",
+            "notificationId": notification_adhesion.id, "eventType": "nouveau_membre_classe",
+            "acteur": username, "acteur_nom": _nom_compte(db, username),
+            "resource_type": "classe_discussion", "resource_id": discussion.id,
+            "classe_id": classe.id, "classe_nom": classe.nom,
+            "discussion_nom": discussion.nom, "extrait": discussion.nom, "lu": False,
+        })
+        await envoyer_notifications_push(db, [notification_adhesion])
     return {"success": True, "classe_id": classe.id, "discussion_id": discussion.id}
 
 
@@ -1325,13 +1378,30 @@ async def rejoindre_classe_depuis_discussion(classe_id: int, data: dict, db: Ses
     db.add(ClasseMembre(classe_id=classe.id, username=username, role="membre"))
     db.flush()
     assurer_discussion(db, classe)
+    notification_adhesion = None
+    if classe.createur_username != username:
+        notification_adhesion = NotificationGrind(
+            destinataire_username=classe.createur_username,
+            acteur_username=username,
+            type="nouveau_membre_classe",
+            resource_type="classe",
+            resource_id=classe.id,
+            classe_id=classe.id,
+            extrait=classe.nom[:240],
+        )
+        db.add(notification_adhesion)
     db.commit()
-    await manager.notifier_nouveau_membre_classe(classe.id, classe.nom, classe.createur_username, username)
-    await envoyer_push_a_utilisateur(
-        db, classe.createur_username, "Nouveau membre dans ta classe",
-        f"{username} a rejoint la classe « {classe.nom} ».",
-        {"event_type": "nouveau_membre_classe", "classe_id": classe.id},
-    )
+    if notification_adhesion is not None:
+        db.refresh(notification_adhesion)
+        await manager.notifier_utilisateur(classe.createur_username, {
+            "type": "persistante", "id": f"notification-{notification_adhesion.id}",
+            "notificationId": notification_adhesion.id, "eventType": "nouveau_membre_classe",
+            "acteur": username, "acteur_nom": _nom_compte(db, username),
+            "resource_type": "classe", "resource_id": classe.id,
+            "classe_id": classe.id, "classe_nom": classe.nom,
+            "extrait": classe.nom, "lu": False,
+        })
+        await envoyer_notifications_push(db, [notification_adhesion])
     return {"success": True, "classe_id": classe.id, "deja_membre": False}
 
 

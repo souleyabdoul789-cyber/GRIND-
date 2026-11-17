@@ -12,6 +12,7 @@ Principes (tous appliqués ICI, côté serveur) :
 
 import re
 import secrets
+import logging
 import hashlib
 import unicodedata
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,8 @@ from schemas import (
 from validation import (
     email_canonique, masquer_email, valider_email, valider_mot_de_passe, valider_pseudo,
 )
+
+logger = logging.getLogger("grind.compte")
 
 router = APIRouter()
 
@@ -576,12 +579,20 @@ async def connexion_google(data: GoogleAuthRequest, db: Session = Depends(get_db
     try:
         from google.oauth2 import id_token
         from google.auth.transport import requests as google_requests
+        from google.auth.exceptions import TransportError
     except ImportError:
         _erreur(503, "google_dependance_absente", "La vérification Google est indisponible côté serveur. Installe les dépendances déclarées dans requirements.txt.")
     try:
         claims = id_token.verify_oauth2_token(data.credential, google_requests.Request(), audience=client_id)
-    except Exception:
-        _erreur(401, "google_jeton_invalide", "La validation de ton compte Google a échoué. Recommence.")
+    except TransportError as erreur_transport:
+        logger.warning("Validation Google indisponible faute de réponse Google (%s)", type(erreur_transport).__name__)
+        _erreur(503, "google_validation_indisponible", "Le service de validation Google est momentanément injoignable. Réessaie dans un instant.")
+    except ValueError as erreur_jeton:
+        logger.info("Jeton Google refusé (%s)", type(erreur_jeton).__name__)
+        _erreur(401, "google_jeton_invalide", "La validation de ton compte Google a échoué. Vérifie le Client ID Web configuré sur GRIND puis recommence.")
+    except Exception as erreur_google:
+        logger.warning("Erreur inattendue pendant la validation Google (%s)", type(erreur_google).__name__)
+        _erreur(503, "google_validation_indisponible", "La vérification Google est momentanément indisponible. Réessaie dans un instant.")
     issuer = claims.get("iss")
     if issuer not in {"accounts.google.com", "https://accounts.google.com"} or claims.get("email_verified") is not True:
         _erreur(401, "google_identite_non_verifiee", "Google n'a pas confirmé cette adresse e-mail.")

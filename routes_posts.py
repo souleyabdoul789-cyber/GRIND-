@@ -27,8 +27,8 @@ from auth_grind import verifier_session
 from schemas import PostCreate, CommentaireCreate, LikeToggle, ResoudrePost, ExpirerPost
 from post_media_cleanup import supprimer_post_et_documents_associes
 
-from models import (Post, PostLike, PostCommentaire, PostCommentaireLike, Profil, CompteGrind, NotificationGrind,
-                    LibraryPlaylist, LibraryDocument)
+from models import (Post, PostLike, PostCommentaire, PostCommentaireLike, Profil, CompteGrind, Classe, ClasseDiscussion,
+                    ClasseDiscussionMessage, NotificationGrind, LibraryPlaylist, LibraryDocument)
 from models_proviseur import ProviseurCandidature, ProviseurAutorisation, Etablissement
 from library_service import obtenir_playlist_globale
 from moderation import badge_de, usernames_sanctionnes, bloques_par
@@ -563,15 +563,65 @@ async def suggestions_utilisateurs(session_token: str, q: str = "", db: Session 
 async def lister_notifications(session_token: str, db: Session = Depends(get_db)):
     username = _identite(session_token, db)
     lignes = db.query(NotificationGrind).filter_by(destinataire_username=username).order_by(NotificationGrind.created_at.desc()).limit(50).all()
+
+    usernames = {n.acteur_username for n in lignes if n.acteur_username}
+    comptes = db.query(CompteGrind).filter(CompteGrind.username.in_(usernames)).all() if usernames else []
+    comptes_map = {c.username: c for c in comptes}
+    classe_ids = {int(n.classe_id) for n in lignes if n.classe_id}
+    classes = db.query(Classe).filter(Classe.id.in_(classe_ids)).all() if classe_ids else []
+    classes_map = {c.id: c for c in classes}
+
+    # Pour un événement d'adhésion, resource_id désigne directement la discussion.
+    # Pour un message/une mention, resource_id désigne le message ; on retrouve
+    # sa discussion via la ligne du message au lieu de deviner par classe_id.
+    discussion_ids = {
+        int(n.resource_id) for n in lignes
+        if n.resource_type == "classe_discussion" and n.resource_id
+    }
+    message_ids = {
+        int(n.resource_id) for n in lignes
+        if n.resource_type == "classe_discussion_message" and n.resource_id
+    }
+    messages = db.query(ClasseDiscussionMessage).filter(ClasseDiscussionMessage.id.in_(message_ids)).all() if message_ids else []
+    discussion_ids.update(int(m.discussion_id) for m in messages if m.discussion_id)
+    discussions = db.query(ClasseDiscussion).filter(ClasseDiscussion.id.in_(discussion_ids)).all() if discussion_ids else []
+    discussions_map = {d.id: d for d in discussions}
+    discussion_id_par_message = {m.id: m.discussion_id for m in messages}
+
     notifications = []
     for n in lignes:
-        acteur = db.get(CompteGrind, n.acteur_username)
-        notifications.append({"id": n.id, "type": n.type, "acteur": n.acteur_username,
+        acteur = comptes_map.get(n.acteur_username)
+        classe = classes_map.get(n.classe_id)
+        discussion_id = (
+            n.resource_id if n.resource_type == "classe_discussion"
+            else discussion_id_par_message.get(n.resource_id) if n.resource_type == "classe_discussion_message"
+            else None
+        )
+        discussion = discussions_map.get(discussion_id)
+        notifications.append({
+            "id": n.id, "type": n.type, "acteur": n.acteur_username,
             "acteur_nom": " ".join(x for x in [acteur.prenom, acteur.nom] if x).strip() if acteur else n.acteur_username,
             "post_id": n.post_id, "commentaire_id": n.commentaire_id,
-            "resource_type": n.resource_type, "resource_id": n.resource_id, "classe_id": getattr(n, "classe_id", None),
-            "extrait": n.extrait, "lu": bool(n.lu), "created_at": n.created_at.isoformat() if n.created_at else None})
+            "resource_type": n.resource_type, "resource_id": n.resource_id,
+            "classe_id": getattr(n, "classe_id", None),
+            "classe_nom": classe.nom if classe else None,
+            "discussion_nom": discussion.nom if discussion else None,
+            "extrait": n.extrait, "lu": bool(n.lu),
+            "created_at": n.created_at.isoformat() if n.created_at else None,
+        })
     return {"notifications": notifications}
+
+
+@router.post("/api/notifications/lues")
+async def marquer_toutes_notifications_lues(data: dict, db: Session = Depends(get_db)):
+    """Acquitte en une seule opération les notifications persistantes du compte courant."""
+    username = _identite(data.get("session_token", ""), db)
+    db.query(NotificationGrind).filter(
+        NotificationGrind.destinataire_username == username,
+        NotificationGrind.lu == 0,
+    ).update({NotificationGrind.lu: 1}, synchronize_session=False)
+    db.commit()
+    return {"success": True}
 
 
 @router.post("/api/notifications/{notification_id}/lue")

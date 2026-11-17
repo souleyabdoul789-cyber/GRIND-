@@ -9,7 +9,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from models import GrindPushToken, CompteGrind
+from models import GrindPushToken, CompteGrind, Classe
 
 logger = logging.getLogger("grind.push")
 
@@ -152,19 +152,35 @@ async def envoyer_notifications_push(db, notifications):
         "commentaire_doc": "a commenté un document de ta Library",
     }
 
+    classe_ids = {int(n.classe_id) for n in notifications if n.classe_id}
+    classes = db.query(Classe).filter(Classe.id.in_(classe_ids)).all() if classe_ids else []
+    classes_map = {c.id: c for c in classes}
+
     par_destinataire = {}
     for notification in notifications:
         acteur = db.get(CompteGrind, notification.acteur_username)
         acteur_nom = " ".join(
             x for x in [getattr(acteur, "prenom", None), getattr(acteur, "nom", None)] if x
         ).strip() if acteur else notification.acteur_username
-        phrase = bodies.get(notification.type, "a interagi avec ton contenu")
-        body = f"{acteur_nom} {phrase}"
-        extrait = (notification.extrait or "").strip()
-        if extrait and notification.type != "mention_classe":
-            body = f"{body} · {extrait}"[:240]
+        extrait = " ".join(str(notification.extrait or "").split())
+        classe = classes_map.get(notification.classe_id)
+        if notification.type == "message_classe":
+            title = f"Classe · {classe.nom}" if classe else "Discussion de classe"
+            body = f"{acteur_nom} : {extrait or 'Nouveau message'}"
+        elif notification.type == "nouveau_membre_classe":
+            title = f"Classe · {classe.nom}" if classe else "Nouvelle adhésion"
+            sujet = "la discussion" if notification.resource_type == "classe_discussion" else "la classe"
+            body = f"{acteur_nom} a rejoint {sujet}"
+            if notification.resource_type == "classe_discussion" and extrait:
+                body = f"{acteur_nom} a rejoint la discussion « {extrait} »"
+        else:
+            phrase = bodies.get(notification.type, "a interagi avec ton contenu")
+            body = f"{acteur_nom} {phrase}"
+            if extrait and notification.type != "mention_classe":
+                body = f"{body} · {extrait}"[:240]
+            title = "GRIND"
         payload = {
-            "title": "GRIND",
+            "title": title[:80],
             "body": body[:240],
             "data": _message_data(notification),
         }
