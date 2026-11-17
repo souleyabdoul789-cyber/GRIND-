@@ -81,6 +81,7 @@ from routes_posts import _serialiser as serialiser_post
 from ws_manager import manager
 from push_notifications import envoyer_push_a_tous
 from account_purge import purger_compte
+from post_media_cleanup import supprimer_post_et_documents_associes
 
 router = APIRouter()
 
@@ -427,9 +428,7 @@ def _supprimer_contenu(sig: Signalement, db: Session) -> bool:
         post = db.get(Post, post_id)
         if post is None:
             return False
-        db.query(PostLike).filter(PostLike.post_id == post_id).delete()
-        db.query(PostCommentaire).filter(PostCommentaire.post_id == post_id).delete()
-        db.delete(post)
+        supprimer_post_et_documents_associes(db, post)
         return True
     if sig.type_cible == "commentaire":
         try:
@@ -942,9 +941,7 @@ def _supprimer_post(db: Session, post_id: int) -> bool:
     post = db.get(Post, post_id)
     if post is None:
         return False
-    db.query(PostLike).filter(PostLike.post_id == post_id).delete()
-    db.query(PostCommentaire).filter(PostCommentaire.post_id == post_id).delete()
-    db.delete(post)
+    supprimer_post_et_documents_associes(db, post)
     return True
 
 

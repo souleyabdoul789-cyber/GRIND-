@@ -25,6 +25,8 @@ from sqlalchemy import or_
 from database import get_db
 from auth_grind import verifier_session
 from schemas import PostCreate, CommentaireCreate, LikeToggle, ResoudrePost, ExpirerPost
+from post_media_cleanup import supprimer_post_et_documents_associes
+
 from models import (Post, PostLike, PostCommentaire, PostCommentaireLike, Profil, CompteGrind, NotificationGrind,
                     LibraryPlaylist, LibraryDocument)
 from models_proviseur import ProviseurCandidature, ProviseurAutorisation, Etablissement
@@ -523,9 +525,7 @@ async def supprimer_post(post_id: int, session_token: str, db: Session = Depends
     if post.auteur_username != username:
         raise HTTPException(status_code=403, detail="Seul l'auteur peut supprimer ce post")
 
-    db.query(PostLike).filter(PostLike.post_id == post_id).delete()
-    db.query(PostCommentaire).filter(PostCommentaire.post_id == post_id).delete()
-    db.delete(post)
+    supprimer_post_et_documents_associes(db, post)
     db.commit()
 
     return {"success": True}
@@ -541,9 +541,8 @@ async def moderation_locale_post(post_id: int, data: LikeToggle, db: Session = D
     if post is None or post.etablissement_id is None:
         raise HTTPException(status_code=404, detail="Publication institutionnelle introuvable.")
     _autorisation_etablissement(username, post.etablissement_id, db, besoin_moderation=True)
-    db.query(PostLike).filter(PostLike.post_id == post_id).delete()
-    db.query(PostCommentaire).filter(PostCommentaire.post_id == post_id).delete()
-    db.delete(post); db.commit()
+    supprimer_post_et_documents_associes(db, post)
+    db.commit()
     return {"success": True}
 
 

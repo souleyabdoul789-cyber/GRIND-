@@ -610,12 +610,31 @@ def supprimer_assets_cloudinary(urls: list[str]) -> dict:
                     "signature": _signer(params),
                 }
                 endpoint = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/{resource_type}/destroy"
-                response = client.post(endpoint, data=donnees)
-                resultat = response.json() if response.content else {}
-                if response.status_code == 200 and resultat.get("result") in ("ok", "not found"):
+                resultat = {}
+                supprime = False
+                status_code = None
+                for tentative in range(3):
+                    try:
+                        response = client.post(endpoint, data=donnees)
+                        status_code = response.status_code
+                        resultat = response.json() if response.content else {}
+                        if response.status_code == 200 and resultat.get("result") in ("ok", "not found"):
+                            supprime = True
+                            break
+                        # Reprise uniquement pour les erreurs transitoires ; une
+                        # erreur d'authentification ou de validation ne sera pas martelée.
+                        transitoire = response.status_code == 429 or response.status_code >= 500
+                        if not transitoire or tentative == 2:
+                            break
+                    except httpx.HTTPError:
+                        if tentative == 2:
+                            break
+                    time.sleep(0.5 * (tentative + 1))
+                if supprime:
                     supprimes += 1
                 else:
                     non_supprimes += 1
+                    logger.warning("Suppression Cloudinary non confirmée pour %s (HTTP %s, réponse %s)", public_id, status_code if status_code is not None else "réseau", str(resultat)[:180])
             except Exception:
                 non_supprimes += 1
     logger.info("Purge Cloudinary compte GRIND : %s asset(s) supprimé(s), %s non supprimé(s)", supprimes, non_supprimes)

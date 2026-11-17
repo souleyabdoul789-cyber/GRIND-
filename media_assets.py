@@ -89,10 +89,12 @@ _CLE_URLS_MEDIA_A_PURGER = "grind_media_urls_after_commit"
 
 
 def _urls_media_public_post(post: Post) -> set[str]:
-    """Récupère uniquement les images/vidéos du fil, jamais les documents Library."""
+    """Récupère les images/vidéos et le document attachés à une publication."""
     urls: set[str] = set()
     if post.media_url:
         urls.add(str(post.media_url))
+    if post.document_url:
+        urls.add(str(post.document_url))
     try:
         elements = json.loads(post.medias_json or "[]")
     except (TypeError, ValueError):
@@ -115,8 +117,11 @@ def _enregistrer_urls_a_purger(session, urls) -> None:
         if reference is None:
             continue
         resource_type, public_id, _version = reference
-        # On ne détruit que les ressources médias publiques créées dans le dossier du fil.
-        if resource_type in {"image", "video"} and public_id.startswith("grind_posts/"):
+        # Limites strictes de dossiers : jamais les médias privés de discussion,
+        # les avatars ou les logos d'établissement.
+        dossier_post = resource_type in {"image", "video"} and public_id.startswith("grind_posts/")
+        dossier_document = resource_type == "raw" and public_id.startswith(("grind_documents/", "grind_library/"))
+        if dossier_post or dossier_document:
             candidates.add(str(url))
 
 
@@ -133,9 +138,9 @@ def _media_encore_reference(db: Session, url: str) -> bool:
     motif = f"%{public_id}%"
 
     checks = (
-        db.query(Post.id).filter(or_(Post.media_url.like(motif), Post.medias_json.like(motif))).first(),
-        db.query(PostCommentaire.id).filter(PostCommentaire.media_url.like(motif)).first(),
-        db.query(Annonce.id).filter(Annonce.media_url.like(motif)).first(),
+        db.query(Post.id).filter(or_(Post.media_url.like(motif), Post.document_url.like(motif), Post.medias_json.like(motif))).first(),
+        db.query(PostCommentaire.id).filter(or_(PostCommentaire.media_url.like(motif), PostCommentaire.document_url.like(motif))).first(),
+        db.query(Annonce.id).filter(or_(Annonce.media_url.like(motif), Annonce.document_url.like(motif))).first(),
         db.query(LibraryDocument.id).filter(LibraryDocument.fichier_url.like(motif)).first(),
         db.query(ClasseDiscussionMessage.id).filter(ClasseDiscussionMessage.piece_url.like(motif)).first(),
         db.query(ClasseDiscussion.id).filter(ClasseDiscussion.photo_url.like(motif)).first(),
@@ -188,12 +193,15 @@ def _post_avant_suppression(_mapper, connection, target: Post) -> None:
 
 
 def _commentaire_avant_suppression(_mapper, _connection, target: PostCommentaire) -> None:
-    _enregistrer_urls_a_purger(object_session(target), [target.media_url])
+    _enregistrer_urls_a_purger(object_session(target), [target.media_url, target.document_url])
 
 
 def _annonce_avant_suppression(_mapper, _connection, target: Annonce) -> None:
-    # Une annonce peut porter une image ou une vidéo. document_url est volontairement exclu.
-    _enregistrer_urls_a_purger(object_session(target), [target.media_url])
+    _enregistrer_urls_a_purger(object_session(target), [target.media_url, target.document_url])
+
+
+def _document_library_avant_suppression(_mapper, _connection, target: LibraryDocument) -> None:
+    _enregistrer_urls_a_purger(object_session(target), [target.fichier_url])
 
 
 def _capturer_suppression_sql_masse(execute_state) -> None:
@@ -208,9 +216,9 @@ def _capturer_suppression_sql_masse(execute_state) -> None:
 
     db = execute_state.session
     if table == "posts":
-        rows = db.execute(select(Post.media_url, Post.medias_json).where(where)).all()
-        for media_url, medias_json in rows:
-            urls = [media_url]
+        rows = db.execute(select(Post.media_url, Post.document_url, Post.medias_json).where(where)).all()
+        for media_url, document_url, medias_json in rows:
+            urls = [media_url, document_url]
             try:
                 elements = json.loads(medias_json or "[]")
             except (TypeError, ValueError):
@@ -222,11 +230,11 @@ def _capturer_suppression_sql_masse(execute_state) -> None:
                 )
             _enregistrer_urls_a_purger(db, urls)
     elif table == "post_commentaires":
-        rows = db.execute(select(PostCommentaire.media_url).where(where)).all()
-        _enregistrer_urls_a_purger(db, (row[0] for row in rows))
+        rows = db.execute(select(PostCommentaire.media_url, PostCommentaire.document_url).where(where)).all()
+        _enregistrer_urls_a_purger(db, (url for row in rows for url in row))
     else:  # annonces
-        rows = db.execute(select(Annonce.media_url).where(where)).all()
-        _enregistrer_urls_a_purger(db, (row[0] for row in rows))
+        rows = db.execute(select(Annonce.media_url, Annonce.document_url).where(where)).all()
+        _enregistrer_urls_a_purger(db, (url for row in rows for url in row))
 
 
 def _apres_commit_media(session) -> None:
@@ -251,6 +259,7 @@ def _apres_rollback_media(session) -> None:
 event.listen(Post, "before_delete", _post_avant_suppression, propagate=True)
 event.listen(PostCommentaire, "before_delete", _commentaire_avant_suppression, propagate=True)
 event.listen(Annonce, "before_delete", _annonce_avant_suppression, propagate=True)
+event.listen(LibraryDocument, "before_delete", _document_library_avant_suppression, propagate=True)
 event.listen(Session, "do_orm_execute", _capturer_suppression_sql_masse)
 event.listen(Session, "after_commit", _apres_commit_media)
 event.listen(Session, "after_rollback", _apres_rollback_media)

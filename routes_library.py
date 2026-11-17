@@ -318,6 +318,28 @@ async def lister_commentaires_document(document_id: int, session_token: str, db:
 
 
 
+@router.delete("/api/library/documents/{document_id}")
+async def supprimer_document_library(document_id: int, session_token: str, db: Session = Depends(get_db)):
+    """L'auteur peut retirer son document ; la suppression physique suit après commit."""
+    username = _user(session_token, db)
+    doc = db.get(LibraryDocument, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document introuvable.")
+    if doc.auteur_username != username:
+        raise HTTPException(status_code=403, detail="Seul l'auteur peut supprimer ce document.")
+
+    try:
+        db.query(LibraryDocumentVote).filter_by(document_id=document_id).delete(synchronize_session=False)
+        db.query(LibraryDocumentComment).filter_by(document_id=document_id).delete(synchronize_session=False)
+        db.delete(doc)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Échec de suppression du document Library id=%s", document_id)
+        raise HTTPException(status_code=500, detail="Le document n'a pas pu être supprimé. Réessaie.")
+    return {"success": True, "document_id": document_id}
+
+
 @router.get("/api/library/documents/{document_id}")
 async def obtenir_document_library(document_id: int, session_token: str, db: Session = Depends(get_db)):
     username = _user(session_token, db)
