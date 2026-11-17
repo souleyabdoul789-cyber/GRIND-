@@ -2,11 +2,11 @@
 moderation.py — rôles, permissions et clé d'administration de GRIND.
 
 QUI EST QUI
-- admin       : UN seul compte. On y entre avec la clé d'administration à la
-                place du mot de passe (voir routes_compte.py). Il nomme l'équipe,
-                publie les annonces, a tous les droits.
-- associe     : équipe de confiance — modération complète + certification.
-- controleur  : équipe de modération — traite les signalements, suspensions courtes.
+- admin       : compte officiel unique, authentifié par la clé d'administration.
+- associe     : équipe de confiance — modération complète, certification et équipe.
+- controleur  : traite les signalements et applique les suspensions courtes.
+- annonceur   : publie des annonces non prioritaires pour la communauté.
+- supprimeur  : retire des contenus/classes de comptes déjà sanctionnés.
 - (aucun)     : élève ordinaire.
 
 LA CLÉ D'ADMINISTRATION
@@ -33,16 +33,20 @@ CGU_VERSION = "2026-11-17"
 ROLE_ADMIN = "admin"
 ROLE_ASSOCIE = "associe"
 ROLE_CONTROLEUR = "controleur"
-ROLES_EQUIPE = (ROLE_ASSOCIE, ROLE_CONTROLEUR)
+ROLE_ANNONCEUR = "annonceur"
+ROLE_SUPPRIMEUR = "supprimeur"
+ROLES_EQUIPE = (ROLE_ASSOCIE, ROLE_CONTROLEUR, ROLE_ANNONCEUR, ROLE_SUPPRIMEUR)
 TOUS_LES_ROLES = (ROLE_ADMIN,) + ROLES_EQUIPE
 
 SUSPENSION_COURTE_MAX_JOURS = 7
 
 _BASE_CONTROLEUR = {"signalements", "utilisateurs", "suspension_courte", "support"}
-_BASE_ASSOCIE = _BASE_CONTROLEUR | {"suspension", "bannissement", "lever_sanction", "certification", "examens"}
+_BASE_ASSOCIE = _BASE_CONTROLEUR | {"suspension", "bannissement", "lever_sanction", "certification", "examens", "suppression"}
 PERMISSIONS = {
     ROLE_CONTROLEUR: _BASE_CONTROLEUR,
-    ROLE_ASSOCIE: _BASE_ASSOCIE,
+    ROLE_ASSOCIE: _BASE_ASSOCIE | {"equipe", "annonces"},
+    ROLE_ANNONCEUR: {"annonces"},
+    ROLE_SUPPRIMEUR: {"suppression"},
     ROLE_ADMIN: _BASE_ASSOCIE | {"equipe", "annonces"},
 }
 

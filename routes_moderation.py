@@ -3,7 +3,7 @@ routes_moderation.py — signalements, administration, équipe, certification, a
 
 Comme partout dans GRIND : l'identité vient de la session (auth_grind), jamais
 d'un champ envoyé par le client. Les DROITS viennent du rôle stocké en base
-(compte.role) : "admin", "associe" ou "controleur" — voir moderation.py. Le seul
+(compte.role) : "admin", "associe", "controleur", "annonceur" ou "supprimeur" — voir moderation.py. Le seul
 moyen de devenir admin est la clé d'administration (routes_compte.py).
 
 Toutes les routes reçoivent le session_token dans le corps de la requête
@@ -25,12 +25,16 @@ from moderation import (
     CGU_VERSION,
     NOM_ADMIN_PAR_DEFAUT,
     ROLE_ADMIN,
+    ROLE_ASSOCIE,
+    ROLE_ANNONCEUR,
+    ROLE_SUPPRIMEUR,
     ROLES_EQUIPE,
     SUSPENSION_COURTE_MAX_JOURS,
     PERMISSIONS,
     a_permission,
     role_de,
     sanction_active,
+    usernames_sanctionnes,
     detail_sanction,
     bloques_par,
     badge_de,
@@ -47,6 +51,7 @@ from schemas import (
     AdminLever,
     AdminNom,
     AdminEquipeNommer,
+    AdminDossierSuppression,
     AdminCertifier,
     AdminAnnoncePublier,
     AdminAnnonceSupprimer,
@@ -73,8 +78,14 @@ from models import (
     Blocage,
     Classe,
     ClasseMembre,
+    ClasseFeuille,
+    ClasseFeuillePermission,
+    ClasseTableau,
     ClasseDiscussion,
+    ClasseDiscussionMembre,
     ClasseDiscussionMessage,
+    ClasseDiscussionMention,
+    NotificationGrind,
     LibraryDocument,
 )
 from routes_posts import _serialiser as serialiser_post
@@ -248,7 +259,10 @@ def _serialiser_annonce(a: Annonce, db: Session) -> dict:
         "contenu": a.contenu,
         "created_at": _iso(a.created_at),
         "auteur": _nom_affichable(auteur) if auteur else NOM_ADMIN_PAR_DEFAUT,
-        "role": ROLE_ADMIN,
+        "auteur_username": a.auteur_username,
+        # Une annonce non-administrative n'a pu être publiée que par un annonceur
+        # autorisé à cet instant. Conserver cette attribution après retrait du rôle.
+        "role": auteur.role if auteur and auteur.role in (ROLE_ADMIN, ROLE_ASSOCIE, ROLE_ANNONCEUR) else ROLE_ANNONCEUR,
         "media_url": a.media_url,
         "media_type": a.media_type,
         "document_url": a.document_url,
@@ -270,23 +284,27 @@ async def lister_annonces(data: SessionRequest, db: Session = Depends(get_db)):
 
 @router.post("/api/admin/apercu")
 async def apercu(data: SessionRequest, db: Session = Depends(get_db)):
-    _acteur(data.session_token, db)
+    _, role = _acteur(data.session_token)
+    droits = PERMISSIONS.get(role, set())
+    # Ne jamais exposer les statistiques d'autres services à un rôle spécialisé.
     return {
-        "nb_signalements_ouverts": db.query(Signalement).filter(Signalement.statut == "ouvert").count(),
-        "nb_comptes": db.query(CompteGrind).filter(CompteGrind.username != ADMIN_USERNAME).count(),
-        "nb_certifies": db.query(CompteGrind).filter(CompteGrind.certifie == 1).count(),
-        "nb_equipe": db.query(CompteGrind).filter(CompteGrind.role.in_(ROLES_EQUIPE)).count(),
-        "nb_annonces": db.query(Annonce).count(),
+        "nb_signalements_ouverts": db.query(Signalement).filter(Signalement.statut == "ouvert").count() if "signalements" in droits else 0,
+        "nb_comptes": db.query(CompteGrind).filter(CompteGrind.username != ADMIN_USERNAME).count() if "utilisateurs" in droits else 0,
+        "nb_certifies": db.query(CompteGrind).filter(CompteGrind.certifie == 1).count() if "certification" in droits else 0,
+        "nb_equipe": db.query(CompteGrind).filter(CompteGrind.role.in_(ROLES_EQUIPE)).count() if "equipe" in droits else 0,
+        "nb_annonces": db.query(Annonce).count() if "annonces" in droits else 0,
         "nb_support_attente": db.query(SupportConversation).filter(
             SupportConversation.statut == "ouvert", SupportConversation.attente_equipe == 1
-        ).count(),
-        "nb_examens_attente": db.query(Examen).filter(Examen.statut == "en_attente").count(),
+        ).count() if "support" in droits else 0,
+        "nb_examens_attente": db.query(Examen).filter(Examen.statut == "en_attente").count() if "examens" in droits else 0,
     }
 
 
 @router.post("/api/admin/nom")
 async def definir_nom(data: AdminNom, db: Session = Depends(get_db)):
-    username, role = _acteur(data.session_token, db, "annonces")  # réservé à l'admin
+    username, role = _acteur(data.session_token, db, "annonces")
+    if role != ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="Seul le compte officiel GRIND peut définir le nom d'administration.")
     nom = data.nom_affiche.strip()
     if not (2 <= len(nom) <= 40):
         raise HTTPException(status_code=400, detail="Le nom doit faire entre 2 et 40 caractères")
@@ -639,9 +657,11 @@ async def lister_equipe(data: SessionRequest, db: Session = Depends(get_db)):
 
 @router.post("/api/admin/equipe/nommer")
 async def nommer_membre(data: AdminEquipeNommer, db: Session = Depends(get_db)):
-    _acteur(data.session_token, db, "equipe")
+    _, role_acteur = _acteur(data.session_token, db, "equipe")
     if data.role not in ROLES_EQUIPE:
-        raise HTTPException(status_code=400, detail="Rôle invalide : associé ou contrôleur uniquement")
+        raise HTTPException(status_code=400, detail="Rôle invalide : choisis un rôle d’équipe autorisé.")
+    if role_acteur != ROLE_ADMIN and data.role in ("associe", ROLE_ANNONCEUR, ROLE_SUPPRIMEUR):
+        raise HTTPException(status_code=403, detail="Seul le compte officiel GRIND peut nommer un associé, un annonceur ou un responsable des retraits.")
     compte = db.get(CompteGrind, data.username.strip())
     if compte is None or compte.username == ADMIN_USERNAME:
         raise HTTPException(status_code=404, detail="Compte GRIND introuvable")
@@ -654,10 +674,12 @@ async def nommer_membre(data: AdminEquipeNommer, db: Session = Depends(get_db)):
 
 @router.post("/api/admin/equipe/retirer")
 async def retirer_membre(data: AdminLever, db: Session = Depends(get_db)):
-    _acteur(data.session_token, db, "equipe")
+    _, role_acteur = _acteur(data.session_token, db, "equipe")
     compte = db.get(CompteGrind, data.username.strip())
     if compte is None or compte.role not in ROLES_EQUIPE:
         raise HTTPException(status_code=404, detail="Ce compte n'est pas dans l'équipe")
+    if role_acteur != ROLE_ADMIN and compte.role in ("associe", ROLE_ANNONCEUR, ROLE_SUPPRIMEUR):
+        raise HTTPException(status_code=403, detail="Seul le compte officiel GRIND peut retirer un associé, un annonceur ou un responsable des retraits.")
     compte.role = None
     db.commit()
     return {"success": True}
@@ -676,13 +698,15 @@ async def certifier(data: AdminCertifier, db: Session = Depends(get_db)):
     return {"success": True, "certifie": bool(data.certifie)}
 
 
-# ------------------------------------------------------------------ annonces (admin uniquement)
+# ------------------------------------------------------------------ annonces (administration et annonceurs habilités)
 
 @router.post("/api/admin/annonces/publier")
 async def publier_annonce(data: AdminAnnoncePublier, db: Session = Depends(get_db)):
     username, role = _acteur(data.session_token, db, "annonces")
-    if role != ROLE_ADMIN:
-        raise HTTPException(status_code=403, detail="Seul l'administrateur officiel peut publier une annonce GRIND.")
+    if role not in (ROLE_ADMIN, ROLE_ASSOCIE, ROLE_ANNONCEUR):
+        raise HTTPException(status_code=403, detail="La publication d’annonces est réservée à l’administration et aux annonceurs habilités.")
+    if role != ROLE_ADMIN and (data.important or data.epinglee):
+        raise HTTPException(status_code=403, detail="Seul l’administrateur peut définir une annonce comme importante ou épinglée.")
     titre = (data.titre or "").strip()
     contenu = (data.contenu or "").strip()
     if not (3 <= len(titre) <= 120):
@@ -734,10 +758,12 @@ async def publier_annonce(data: AdminAnnoncePublier, db: Session = Depends(get_d
 
 @router.post("/api/admin/annonces/supprimer")
 async def supprimer_annonce(data: AdminAnnonceSupprimer, db: Session = Depends(get_db)):
-    _acteur(data.session_token, db, "annonces")
+    username, role = _acteur(data.session_token, db, "annonces")
     annonce = db.get(Annonce, data.annonce_id)
     if annonce is None:
         raise HTTPException(status_code=404, detail="Annonce introuvable")
+    if role != ROLE_ADMIN and annonce.auteur_username != username:
+        raise HTTPException(status_code=403, detail="Un annonceur peut uniquement retirer ses propres annonces.")
     db.delete(annonce)
     db.commit()
     return {"success": True}
@@ -935,6 +961,75 @@ async def traiter_examen(data: AdminExamenTraiter, db: Session = Depends(get_db)
     return {"success": True, "statut": ex.statut}
 
 
+# ------------------------------------------------------------------ suppression encadrée (comptes déjà sanctionnés)
+
+@router.post("/api/admin/suppression/comptes")
+async def lister_comptes_sanctionnes(data: AdminRechercheUtilisateurs, db: Session = Depends(get_db)):
+    _acteur(data.session_token, db, "suppression")
+    noms_sanctionnes = usernames_sanctionnes(db)
+    if not noms_sanctionnes:
+        return {"utilisateurs": []}
+    requete = db.query(CompteGrind).filter(
+        CompteGrind.username != ADMIN_USERNAME,
+        CompteGrind.username.in_(noms_sanctionnes),
+    )
+    q = (data.q or "").strip()
+    if q:
+        requete = requete.filter(CompteGrind.username.like(f"%{q}%"))
+    comptes = requete.order_by(CompteGrind.created_at.desc()).limit(100).all()
+    resultat = []
+    for compte in comptes:
+        if role_de(db, compte.username) is not None:
+            continue
+        sanction = sanction_active(db, compte.username)
+        if sanction is None:
+            continue
+        resultat.append({
+            "username": compte.username,
+            "created_at": _iso(compte.created_at),
+            "sanction": {
+                "type": sanction.type,
+                "motif": sanction.motif,
+                "jusqu_a": _iso(sanction.jusqu_a),
+            },
+            "nb_publications": db.query(Post).filter(Post.auteur_username == compte.username).count(),
+            "nb_commentaires": db.query(PostCommentaire).filter(PostCommentaire.username == compte.username).count(),
+            "nb_classes": db.query(Classe).filter(Classe.createur_username == compte.username).count(),
+        })
+    return {"utilisateurs": resultat}
+
+
+@router.post("/api/admin/suppression/dossier")
+async def dossier_suppression(data: AdminDossierSuppression, db: Session = Depends(get_db)):
+    _, role = _acteur(data.session_token, db, "suppression")
+    cible = (data.username or "").strip()
+    compte = db.get(CompteGrind, cible)
+    if compte is None or cible == ADMIN_USERNAME:
+        raise HTTPException(status_code=404, detail="Compte introuvable")
+    _exiger_compte_sanctionne(db, role, cible)
+    posts = db.query(Post).filter(Post.auteur_username == cible).order_by(Post.created_at.desc()).limit(100).all()
+    commentaires = db.query(PostCommentaire).filter(PostCommentaire.username == cible).order_by(PostCommentaire.created_at.desc()).limit(100).all()
+    classes = db.query(Classe).filter(Classe.createur_username == cible).order_by(Classe.created_at.desc()).all()
+    return {
+        "username": cible,
+        "sanction_active": True,
+        "posts": [serialiser_post(post, db) for post in posts],
+        "commentaires": [
+            {"id": commentaire.id, "post_id": commentaire.post_id, "contenu": commentaire.contenu, "created_at": _iso(commentaire.created_at)}
+            for commentaire in commentaires
+        ],
+        "classes": [
+            {
+                "id": classe.id,
+                "nom": classe.nom,
+                "nb_membres": db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count(),
+                "created_at": _iso(classe.created_at),
+            }
+            for classe in classes
+        ],
+    }
+
+
 # ------------------------------------------------------------------ nettoyage d'un dossier
 
 def _supprimer_post(db: Session, post_id: int) -> bool:
@@ -954,18 +1049,26 @@ def _exiger_compte_sanctionne(db: Session, acteur_role: str, username: str):
 
 @router.post("/api/admin/contenu/supprimer")
 async def supprimer_contenu_admin(data: AdminSupprimerContenu, db: Session = Depends(get_db)):
-    _acteur(data.session_token, db, "signalements")
+    _, role = _acteur(data.session_token, db, "suppression")
     try:
         identifiant = int(data.cible_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Identifiant invalide")
     if data.type_cible == "post":
+        post = db.get(Post, identifiant)
+        if post is None:
+            raise HTTPException(status_code=404, detail="Contenu introuvable")
+        if role == ROLE_SUPPRIMEUR:
+            _exiger_compte_sanctionne(db, role, post.auteur_username)
         ok = _supprimer_post(db, identifiant)
     elif data.type_cible == "commentaire":
         commentaire = db.get(PostCommentaire, identifiant)
-        ok = commentaire is not None
-        if ok:
-            db.delete(commentaire)
+        if commentaire is None:
+            raise HTTPException(status_code=404, detail="Contenu introuvable")
+        if role == ROLE_SUPPRIMEUR:
+            _exiger_compte_sanctionne(db, role, commentaire.username)
+        db.delete(commentaire)
+        ok = True
     else:
         raise HTTPException(status_code=400, detail="Type de contenu invalide")
     if not ok:
@@ -976,7 +1079,7 @@ async def supprimer_contenu_admin(data: AdminSupprimerContenu, db: Session = Dep
 
 @router.post("/api/admin/contenu/tout-supprimer")
 async def tout_supprimer(data: AdminToutSupprimer, db: Session = Depends(get_db)):
-    _, role = _acteur(data.session_token, db, "examens")
+    _, role = _acteur(data.session_token, db, "suppression")
     _exiger_compte_sanctionne(db, role, data.username)
     ids = [p.id for p in db.query(Post).filter(Post.auteur_username == data.username).all()]
     for post_id in ids:
@@ -988,12 +1091,41 @@ async def tout_supprimer(data: AdminToutSupprimer, db: Session = Depends(get_db)
 
 @router.post("/api/admin/classe/supprimer")
 async def supprimer_classe_admin(data: AdminSupprimerClasse, db: Session = Depends(get_db)):
-    _, role = _acteur(data.session_token, db, "examens")
+    _, role = _acteur(data.session_token, db, "suppression")
     classe = db.get(Classe, data.classe_id)
     if classe is None:
         raise HTTPException(status_code=404, detail="Classe introuvable")
     _exiger_compte_sanctionne(db, role, classe.createur_username)
-    db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).delete()
+
+    # Réutilise le cycle complet de suppression d'une classe : fermer son salon,
+    # retirer les notifications et enfants du salon, puis les feuilles/tableaux.
+    # Une simple suppression de la ligne Classe laisserait des relations actives.
+    discussion = db.query(ClasseDiscussion).filter_by(classe_id=classe.id).first()
+    if discussion is not None:
+        await manager.fermer_discussion(discussion.id)
+        db.query(NotificationGrind).filter_by(
+            classe_id=classe.id,
+            resource_type="classe_discussion_message",
+        ).delete(synchronize_session=False)
+        message_ids = [row[0] for row in db.query(ClasseDiscussionMessage.id).filter_by(
+            discussion_id=discussion.id
+        ).all()]
+        if message_ids:
+            db.query(ClasseDiscussionMention).filter(
+                ClasseDiscussionMention.message_id.in_(message_ids)
+            ).delete(synchronize_session=False)
+        db.query(ClasseDiscussionMessage).filter_by(
+            discussion_id=discussion.id
+        ).delete(synchronize_session=False)
+        db.query(ClasseDiscussionMembre).filter_by(
+            discussion_id=discussion.id
+        ).delete(synchronize_session=False)
+        db.delete(discussion)
+
+    db.query(ClasseFeuillePermission).filter_by(classe_id=classe.id).delete(synchronize_session=False)
+    db.query(ClasseFeuille).filter_by(classe_id=classe.id).delete(synchronize_session=False)
+    db.query(ClasseTableau).filter_by(classe_id=classe.id).delete(synchronize_session=False)
+    db.query(ClasseMembre).filter_by(classe_id=classe.id).delete(synchronize_session=False)
     db.delete(classe)
     db.commit()
     return {"success": True}

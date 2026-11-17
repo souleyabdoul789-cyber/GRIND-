@@ -21,7 +21,7 @@ class CompteGrind(Base):
     gsociety_username = Column(String(64), nullable=False)  # historique conservé ; "__GRIND_NATIVE__" pour les nouveaux comptes
     cgu_version = Column(String(16), nullable=True)  # version des CGU acceptée
     cgu_acceptees_le = Column(DateTime(timezone=True), nullable=True)
-    role = Column(String(16), nullable=True)  # None = élève ; "admin" / "associe" / "controleur"
+    role = Column(String(16), nullable=True)  # None = élève ; admin / associe / controleur / annonceur / supprimeur
     nom_affiche = Column(String(64), nullable=True)  # surtout pour l'admin (choisi à la première entrée)
     certifie = Column(Integer, nullable=True)  # 1 = badge de certification
     # E-mail : unique par compte. email_verifie : 1 = vérifié ; 0 = inscription récente non vérifiée
@@ -306,7 +306,7 @@ class Sanction(Base):
 
 
 class Annonce(Base):
-    """Annonce officielle publiée par l'administrateur : notification à tous."""
+    """Annonce publiée par l'administration, un associé ou un annonceur habilité."""
     __tablename__ = "annonces"
 
     id = Column(Integer, primary_key=True, autoincrement=True)

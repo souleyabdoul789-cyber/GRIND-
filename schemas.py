@@ -173,7 +173,12 @@ class AdminNom(BaseModel):
 class AdminEquipeNommer(BaseModel):
     session_token: str
     username: str
-    role: str  # "associe" / "controleur"
+    role: str  # "associe" / "controleur" / "annonceur" / "supprimeur"
+
+
+class AdminDossierSuppression(BaseModel):
+    session_token: str
+    username: str
 
 
 class AdminCertifier(BaseModel):
