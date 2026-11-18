@@ -217,6 +217,43 @@ async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
     }
 
 
+@router.post("/api/classes/apercu-invitation")
+async def apercu_invitation_classe(data: ClasseRejoindre, db: Session = Depends(get_db)):
+    """Retourne uniquement le nom, le créateur et l'état d'adhésion au code fourni."""
+    username = _identite(data.session_token, db)
+    code = str(data.code_invitation or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,80}", code):
+        raise HTTPException(status_code=400, detail="Code d'invitation invalide.")
+
+    classe = db.query(Classe).filter(Classe.code_invitation == code).first()
+    if classe is None:
+        raise HTTPException(status_code=404, detail="Aucune classe ne correspond à ce code.")
+    if sanction_active(db, classe.createur_username) is not None:
+        raise HTTPException(status_code=403, detail="Cette classe est temporairement suspendue.")
+
+    createur = db.get(CompteGrind, classe.createur_username)
+    nom_createur = " ".join(
+        partie for partie in [getattr(createur, "prenom", None), getattr(createur, "nom", None)]
+        if partie
+    ).strip() or classe.createur_username
+
+    deja_membre = db.query(ClasseMembre.id).filter_by(
+        classe_id=classe.id, username=username
+    ).first() is not None
+    nombre_membres = db.query(ClasseMembre.id).filter_by(classe_id=classe.id).count()
+    peut_rejoindre = deja_membre or nombre_membres < MAX_MEMBRES_CLASSE
+
+    return {
+        "success": True,
+        "code_invitation": code,
+        "classe_id": classe.id,
+        "nom": classe.nom,
+        "createur": nom_createur,
+        "deja_membre": deja_membre,
+        "peut_rejoindre": peut_rejoindre,
+    }
+
+
 @router.post("/api/classes/rejoindre")
 async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db)):
     username = _identite(data.session_token, db)

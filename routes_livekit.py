@@ -110,6 +110,67 @@ def _jeton_admin_livekit(salle: str) -> str:
     return jwt.encode(charge, LIVEKIT_API_SECRET, algorithm="HS256")
 
 
+async def _lister_participants_vocal(salle: str) -> list[dict]:
+    """Interroge LiveKit directement ; une salle pas encore créée est vide."""
+    base = LIVEKIT_URL.replace("wss://", "https://", 1).replace("ws://", "http://", 1).rstrip("/")
+    endpoint = f"{base}/twirp/livekit.RoomService/ListParticipants"
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.post(
+                endpoint,
+                json={"room": salle},
+                headers={"Authorization": f"Bearer {_jeton_admin_livekit(salle)}"},
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Impossible de vérifier les places de la salle audio.") from exc
+
+    try:
+        donnees = response.json()
+    except ValueError:
+        donnees = {}
+
+    if response.status_code == 404 and donnees.get("code") == "not_found":
+        return []
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Le service audio n'a pas pu confirmer les places disponibles.")
+
+    participants = donnees.get("participants")
+    if not isinstance(participants, list):
+        raise HTTPException(status_code=502, detail="Le service audio a renvoyé un état de salle invalide.")
+    return participants
+
+
+@router.post("/api/livekit/classes/{classe_id}/capacite")
+async def capacite_vocale_classe(classe_id: int, data: dict, db: Session = Depends(get_db)):
+    """Donne le nombre de places audio libres au membre de la classe uniquement."""
+    username = verifier_session(data.get("session_token", ""), db)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Session GRIND invalide ou expirée")
+
+    classe = db.get(Classe, classe_id)
+    if classe is None:
+        raise HTTPException(status_code=404, detail="Classe introuvable")
+    membre = db.query(ClasseMembre.id).filter_by(
+        classe_id=classe_id, username=username
+    ).first()
+    if membre is None:
+        raise HTTPException(status_code=403, detail="Tu ne fais pas partie de cette classe")
+    if sanction_active(db, classe.createur_username) is not None:
+        raise HTTPException(status_code=403, detail="Cette classe est suspendue")
+    if not all([LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL]):
+        raise HTTPException(status_code=503, detail="LiveKit non configuré côté serveur")
+
+    participants = await _lister_participants_vocal(nom_salle_vocale_classe(classe_id))
+    nombre = len(participants)
+    restantes = max(0, MAX_PARTICIPANTS_VOCAL - nombre)
+    return {
+        "participants": nombre,
+        "maximum": MAX_PARTICIPANTS_VOCAL,
+        "places_restantes": restantes,
+        "complet": restantes == 0,
+    }
+
+
 @router.post("/api/livekit/classes/{classe_id}/micro/{cible}")
 async def moderer_micro_classe(
     classe_id: int, cible: str, data: LiveKitModerationRequest, db: Session = Depends(get_db)
