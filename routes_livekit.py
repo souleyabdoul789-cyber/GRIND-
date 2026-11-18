@@ -34,6 +34,11 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 LIVEKIT_URL = os.getenv("LIVEKIT_URL")
 
 DUREE_JETON_SECONDES = 600  # 10 min : limite l’usage d’un ancien jeton après changement de droits
+MAX_PARTICIPANTS_VOCAL = 10
+VERSION_SALLE_VOCALE = "v2"  # nouveau nom pour appliquer RoomConfiguration aux salles créées auparavant
+
+def nom_salle_vocale_classe(classe_id: int) -> str:
+    return f"classe-{classe_id}-vocal-{VERSION_SALLE_VOCALE}"
 
 
 class LiveKitTokenRequest(BaseModel):
@@ -68,7 +73,7 @@ async def obtenir_jeton_livekit(data: LiveKitTokenRequest, db: Session = Depends
     if not all([LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL]):
         raise HTTPException(status_code=500, detail="LiveKit non configuré côté serveur")
 
-    salle = f"classe-{data.classe_id}"
+    salle = nom_salle_vocale_classe(data.classe_id)
     maintenant = int(time.time())
     charge = {
         "iss": LIVEKIT_API_KEY,
@@ -77,6 +82,8 @@ async def obtenir_jeton_livekit(data: LiveKitTokenRequest, db: Session = Depends
         "nbf": maintenant,
         "exp": maintenant + DUREE_JETON_SECONDES,
         "name": username,
+        # Limite appliquée par LiveKit à la création de cette nouvelle salle.
+        "roomConfig": {"maxParticipants": MAX_PARTICIPANTS_VOCAL},
         "video": {
             "room": salle,
             "roomJoin": True,
@@ -134,14 +141,14 @@ async def moderer_micro_classe(
         "canPublishData": True,
     }
     payload = {
-        "room": f"classe-{classe_id}",
+        "room": nom_salle_vocale_classe(classe_id),
         "identity": cible,
         "permission": permission,
     }
     try:
         async with httpx.AsyncClient(timeout=12) as client:
             response = await client.post(
-                endpoint, json=payload, headers={"Authorization": f"Bearer {_jeton_admin_livekit(f'classe-{classe_id}')}"}
+                endpoint, json=payload, headers={"Authorization": f"Bearer {_jeton_admin_livekit(nom_salle_vocale_classe(classe_id))}"}
             )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="Impossible de joindre le service audio LiveKit") from exc

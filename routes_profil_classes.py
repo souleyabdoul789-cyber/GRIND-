@@ -21,7 +21,7 @@ from classe_salle_etendue import ClasseTableauDelegation
 from discussion_service import assurer_discussion
 from ws_manager import manager
 from push_notifications import envoyer_notifications_push
-from classe_salle_service import assurer_prof_et_sieges, prochain_siege
+from classe_salle_service import MAX_MEMBRES_CLASSE, assurer_prof_et_sieges, prochain_siege
 
 router = APIRouter()
 
@@ -221,7 +221,8 @@ async def creer_classe(data: ClasseCreate, db: Session = Depends(get_db)):
 async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db)):
     username = _identite(data.session_token, db)
 
-    classe = db.query(Classe).filter(Classe.code_invitation == data.code_invitation).first()
+    # Verrouille la classe pour sérialiser les adhésions concurrentes.
+    classe = db.query(Classe).filter(Classe.code_invitation == data.code_invitation).with_for_update().first()
     if classe is None:
         raise HTTPException(status_code=404, detail="Lien d'invitation invalide")
 
@@ -238,13 +239,13 @@ async def rejoindre_classe(data: ClasseRejoindre, db: Session = Depends(get_db))
         return {"success": True, "message": "Déjà membre", "classe_id": classe.id}
 
     nb_membres_actuels = db.query(ClasseMembre).filter(ClasseMembre.classe_id == classe.id).count()
-    if nb_membres_actuels >= 10:
-        raise HTTPException(status_code=400, detail="Cette classe a déjà atteint sa limite de 10 élèves")
+    if nb_membres_actuels >= MAX_MEMBRES_CLASSE:
+        raise HTTPException(status_code=400, detail="Cette classe a déjà atteint sa limite de 200 membres")
 
+    # L'adhésion ne dépend pas de la disponibilité d'un pupitre.
+    # Les 9 sièges élèves servent uniquement au placement visuel dans la salle.
     assurer_prof_et_sieges(db, classe)
     siege = prochain_siege(db, classe.id)
-    if siege is None:
-        raise HTTPException(status_code=400, detail="Aucun pupitre disponible dans cette classe")
     db.add(ClasseMembre(classe_id=classe.id, username=username, role="membre", siege_index=siege))
     discussion = assurer_discussion(db, classe)
 

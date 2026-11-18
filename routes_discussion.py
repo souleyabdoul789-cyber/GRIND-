@@ -1,8 +1,8 @@
 """Discussion privée type groupe, liée à chaque classe GRIND.
 
-La classe scolaire garde son plafond historique de 10 membres. Le groupe de
-messages est une entité séparée, plafonnée à 200 membres, et peut donc inclure
-des personnes qui ne prennent pas de siège dans la classe réelle.
+La classe scolaire peut accueillir jusqu’à 200 membres. La salle audio LiveKit
+est indépendante et limite à 10 les participants connectés simultanément. Le
+groupe de messages reste une entité distincte, plafonnée à 200 membres.
 """
 from datetime import datetime, timedelta, timezone
 import asyncio
@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from auth_grind import verifier_session
 from database import get_db
 from discussion_service import assurer_discussion, MAX_MEMBRES_DISCUSSION
+from classe_salle_service import MAX_MEMBRES_CLASSE, assurer_prof_et_sieges, prochain_siege
 from models import (
     Classe, ClasseMembre, ClasseDiscussion, ClasseDiscussionMembre,
     ClasseDiscussionMessage, ClasseDiscussionMessageMasque, ClasseDiscussionMention, CompteGrind,
@@ -1361,7 +1362,7 @@ async def rejoindre_discussion(data: dict, db: Session = Depends(get_db)):
 @router.post("/api/classes/{classe_id}/discussion/rejoindre-classe")
 async def rejoindre_classe_depuis_discussion(classe_id: int, data: dict, db: Session = Depends(get_db)):
     username = _identite(data.get("session_token", ""), db)
-    # Verrouille la classe pendant la vérification des 10 places réelles.
+    # Verrouille la classe pour sérialiser les adhésions et respecter le plafond de 200 membres.
     classe = db.query(Classe).filter_by(id=classe_id).with_for_update().first()
     if classe is None:
         raise HTTPException(status_code=404, detail="Classe introuvable.")
@@ -1373,9 +1374,14 @@ async def rejoindre_classe_depuis_discussion(classe_id: int, data: dict, db: Ses
     if sanction_active(db, classe.createur_username) is not None:
         raise HTTPException(status_code=403, detail="Cette classe est suspendue.")
     count = db.query(ClasseMembre).filter_by(classe_id=classe.id).count()
-    if count >= 10:
-        raise HTTPException(status_code=400, detail="La classe réelle a atteint sa limite de 10 membres. La discussion reste accessible.")
-    db.add(ClasseMembre(classe_id=classe.id, username=username, role="membre"))
+    if count >= MAX_MEMBRES_CLASSE:
+        raise HTTPException(status_code=400, detail="La classe réelle a atteint sa limite de 200 membres. La discussion reste accessible.")
+
+    assurer_prof_et_sieges(db, classe)
+    siege = prochain_siege(db, classe.id)
+    # Aucun siège n'est requis pour adhérer : les membres supplémentaires
+    # restent membres de la classe, même lorsque les 9 pupitres élèves sont occupés.
+    db.add(ClasseMembre(classe_id=classe.id, username=username, role="membre", siege_index=siege))
     db.flush()
     assurer_discussion(db, classe)
     notification_adhesion = None

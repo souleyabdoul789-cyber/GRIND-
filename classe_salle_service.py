@@ -1,12 +1,13 @@
-"""Règles de persistance de la salle scolaire (10 membres maximum).
+"""Capacité d'adhésion à la classe et placement visuel des élèves.
 
-Le propriétaire de la classe reste createur_username. Le professeur actuel est
-prof_username et peut changer sans transférer la propriété. Les élèves gardent
-un pupitre déterministe en base, indépendant de l'ordre d'arrivée LiveKit.
+Une classe accepte jusqu'à 200 membres (professeur compris). La scène ne
+dispose que de 9 pupitres élèves : l'absence de pupitre ne bloque pas
+l'adhésion. Le vocal LiveKit applique séparément sa limite simultanée de 10.
 """
 
 from models import ClasseMembre
 
+MAX_MEMBRES_CLASSE = 200
 NB_SIEGES_ELEVES = 9
 
 
@@ -20,7 +21,7 @@ def professeur_actuel(classe, membres=None):
 
 
 def assurer_prof_et_sieges(db, classe, membres=None):
-    """Répare progressivement les classes historiques sans changer leur capacité.
+    """Répare progressivement les placements sans limiter l'adhésion à la classe.
 
     `membres` peut être préchargé par lots par les routes de liste pour éviter
     une requête SQL supplémentaire par classe.

@@ -11,8 +11,9 @@ MAX_MEMBRES_DISCUSSION = 200
 def assurer_discussion(db: Session, classe: Classe) -> ClasseDiscussion:
     """Create the group's one-to-one record for legacy classes and sync real members.
 
-    Class membership remains capped independently at 10. Group-only invitees may
-    bring the discussion to 200 without taking a seat in the real class.
+    Class membership is independently capped at 200. Group-only invitees may
+    also join the discussion up to its separate 200-member limit. The LiveKit
+    audio room has its own 10-participant simultaneous limit.
     """
     discussion = db.query(ClasseDiscussion).filter_by(classe_id=classe.id).first()
     if discussion is None:
