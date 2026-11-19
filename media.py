@@ -389,6 +389,26 @@ async def signer_upload_media(data: dict, db: Session = Depends(get_db)):
     }
 
 
+def _format_reponse_cloudinary(asset: dict, resource_type: str, public_id: str) -> str:
+    """Récupère le format vérifiable d'un asset Cloudinary.
+
+    Les réponses Cloudinary pour les ressources `raw` ne contiennent pas le champ
+    `format` de façon garantie : leur extension fait partie du `public_id` et de
+    l'URL de livraison. Pour les documents GRIND, on dérive donc l'extension du
+    public_id, puis on la recoupe avec le chemin URL vérifié plus bas. Si Cloudinary
+    fournit malgré tout `format`, une divergence est refusée.
+    """
+    format_reponse = str(asset.get("format") or "").strip().lower()
+    if resource_type != "raw":
+        return format_reponse
+
+    nom_public = public_id.rsplit("/", 1)[-1]
+    extension = nom_public.rsplit(".", 1)[-1].lower() if "." in nom_public else ""
+    if format_reponse and format_reponse != extension:
+        return ""
+    return extension
+
+
 @router.post("/api/media/upload/confirm")
 async def confirmer_upload_media(data: dict, db: Session = Depends(get_db)):
     username = _verifier_compte_upload(data.get("session_token", ""), db)
@@ -409,16 +429,16 @@ async def confirmer_upload_media(data: dict, db: Session = Depends(get_db)):
     parsed = urlparse(secure_url)
     chemin_upload = f"/{resource_type}/upload/"
     segments_url = parsed.path.strip("/").split("/")
-    format_asset = str(asset.get("format") or "").lower()
-    version_index = next((i for i, segment in enumerate(segments_url[3:], start=3)
-                          if re.fullmatch(r"v[0-9]+", segment)), None)
-    chemin_asset = "/".join(segments_url[version_index + 1:]) if version_index is not None else ""
     audio = public_id.startswith("grind_discussion_audio/")
     document = public_id.startswith("grind_documents/")
     prive_discussion = public_id.startswith("grind_discussion_media/")
+    format_asset = _format_reponse_cloudinary(asset, resource_type, public_id)
+    version_index = next((i for i, segment in enumerate(segments_url[3:], start=3)
+                          if re.fullmatch(r"v[0-9]+", segment)), None)
+    chemin_asset = "/".join(segments_url[version_index + 1:]) if version_index is not None else ""
     # Les identifiants raw contiennent déjà l'extension ; vidéo/audio et image
     # utilisent au contraire un public_id sans extension dans l'API Cloudinary.
-    chemin_attendu = (public_id if document else f"{public_id}.{format_asset}") if format_asset else ""
+    chemin_attendu = public_id if document else f"{public_id}.{format_asset}" if format_asset else ""
     host_ok = (
         parsed.scheme == "https" and parsed.hostname == "res.cloudinary.com"
         and parsed.port in (None, 443) and len(segments_url) > 3
